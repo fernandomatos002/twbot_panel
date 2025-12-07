@@ -1,0 +1,51 @@
+/* src/index.css - VERSÃO FINAL E LIMPA DO BLOCO PROBLEMÁTICO */
+/* Carrega as diretivas do Tailwind */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ajustes CSS Manuais */
+.recharts-wrapper, .recharts-surface {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* --- ESTILOS ADICIONADOS DO LOGINSCREEN.JSX --- */
+
+/* Keyframes para animação de partículas */
+@keyframes float {
+  0% {
+    transform: translateY(100vh) translateX(0) rotate(0deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.3;
+  }
+  90% {
+    opacity: 0.3;
+  }
+  100% {
+    transform: translateY(-100vh) translateX(100px) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+/* Keyframes para animação do logo */
+@keyframes float-logo {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-20px); }
+}
+
+/* Classe CSS pura para gradiente radial, usada no LoginScreen */
+.bg-gradient-radial {
+  background: radial-gradient(var(--tw-gradient-stops));
+}
+
+/* Correção de estilo para autofill de navegadores */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 30px rgba(255, 184, 0, 0.05) inset !important;
+  -webkit-text-fill-color: #e2e8f0 !important;
+}

@@ -1,0 +1,322 @@
+/* login.css */
+/* REMOVIDAS: Diretivas do Tailwind já carregadas pelo index.css */
+
+/* --- ESTILOS ADICIONADOS DO LOGINSCREEN.JSX --- */
+
+/* Keyframes para animação de partículas */
+@keyframes float {
+  0% {
+    transform: translateY(100vh) translateX(0) rotate(0deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.3;
+  }
+  90% {
+    opacity: 0.3;
+  }
+  100% {
+    transform: translateY(-100vh) translateX(100px) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+/* Keyframes para animação do logo */
+@keyframes float-logo {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-20px); }
+}
+
+/* Classe CSS pura para gradiente radial, usada no LoginScreen */
+.bg-gradient-radial {
+  background: radial-gradient(var(--tw-gradient-stops));
+}
+
+/* Correção de estilo para autofill de navegadores */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 30px rgba(255, 184, 0, 0.05) inset !important;
+  -webkit-text-fill-color: #e2e8f0 !important; /* Cor do texto autofill */
+}
+
+/* --- Configuração de Fundo e Partículas (Visual Temático) --- */
+.login-wrapper {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Fundo escuro com gradiente */
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); /* Tailwind slate-900 to slate-800 */
+    position: relative;
+    overflow: hidden;
+    font-family: sans-serif; /* Ou sua fonte preferida */
+}
+
+/* Efeito de partículas (usando a classe 'animate-float' do Tailwind/keyframes) */
+.particles {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* --- Container Principal --- */
+.container {
+    position: relative;
+    z-index: 10;
+    display: flex;
+    flex-direction: row; /* Layout lado a lado */
+    max-width: 1000px;
+    width: 90%;
+    background: rgba(15, 23, 42, 0.6); /* Tailwind slate-900 com 60% opacidade */
+    border-radius: 20px; /* Ajuste conforme preferência */
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(5px);
+    border: 1px solid #334155; /* Tailwind slate-700 */
+}
+
+/* --- Seção de Logo/Design (Lateral Esquerda) --- */
+.logo-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+    text-align: center;
+    background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%); /* slate-800 to slate-900 */
+    border-top-left-radius: 20px;
+    border-bottom-left-radius: 20px;
+    color: #fcd34d; /* Tailwind yellow-400 */
+}
+
+.tribal-icon {
+    font-size: 80px;
+    margin-bottom: 10px;
+    text-shadow: 0 0 15px rgba(252, 211, 77, 0.7); /* Sombra amarela */
+    animation: float-logo 4s ease-in-out infinite; /* Aplica animação float */
+}
+
+.logo-title {
+    font-size: 32px;
+    font-weight: bold;
+    letter-spacing: 2px;
+}
+
+.decorative-line {
+    width: 50px;
+    height: 3px;
+    background-color: #fcd34d; /* yellow-400 */
+    margin: 15px 0;
+    box-shadow: 0 0 8px rgba(252, 211, 77, 0.5);
+}
+
+.logo-subtitle {
+    color: #94a3b8; /* slate-400 */
+    font-size: 14px;
+}
+
+/* --- Seção de Autenticação (Formulários) --- */
+.auth-section {
+    flex: 1;
+    padding: 40px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.card {
+    background: transparent; /* O fundo vem do .container */
+}
+
+/* --- Tabs de Navegação --- */
+.tabs {
+    display: flex;
+    margin-bottom: 25px;
+    border-bottom: 2px solid #334155; /* slate-700 */
+}
+
+.tab {
+    padding: 10px 20px;
+    border: none;
+    background: none;
+    color: #94a3b8; /* slate-400 */
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.3s, border-bottom 0.3s;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px; /* Para sobrepor a borda inferior do .tabs */
+}
+
+.tab.active {
+    color: #fcd34d; /* yellow-400 */
+    border-bottom-color: #fcd34d; /* yellow-400 */
+}
+
+/* --- Formulário e Elementos --- */
+.form {
+    display: none; /* Controlado pelo estado do React */
+    flex-direction: column;
+}
+
+.form.active {
+    display: flex; /* Controlado pelo estado do React */
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    color: #fcd34d; /* yellow-400 */
+    font-size: 14px;
+    margin-bottom: 8px;
+    font-weight: 600;
+}
+
+.form-group input[type="text"],
+.form-group input[type="email"],
+.form-group input[type="password"] {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid #475569; /* slate-600 */
+    border-radius: 8px; /* rounded-lg */
+    background-color: #1e293b; /* slate-800 */
+    color: #e2e8f0; /* slate-200 */
+    font-size: 16px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.form-group input:focus {
+    border-color: #fcd34d; /* yellow-400 */
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(252, 211, 77, 0.3); /* Sombra de foco amarela */
+}
+
+/* --- Botão Principal --- */
+.submit-btn {
+    width: 100%;
+    padding: 15px;
+    border: none;
+    border-radius: 12px; /* Um pouco mais arredondado */
+    font-size: 18px;
+    font-weight: bold;
+    cursor: pointer;
+    background: linear-gradient(90deg, #f59e0b, #eab308); /* Tailwind orange-500 to yellow-500 */
+    color: #111827; /* gray-900 */
+    transition: background 0.3s, transform 0.1s;
+    box-shadow: 0 5px 15px rgba(252, 211, 77, 0.4);
+}
+
+.submit-btn:hover {
+    background: linear-gradient(90deg, #fbbf24, #fde047); /* yellow-400 to yellow-300 */
+    transform: translateY(-1px);
+}
+
+/* --- Divisor e Footer --- */
+.divider {
+    text-align: center;
+    margin: 25px 0;
+    position: relative;
+    color: #64748b; /* slate-500 */
+}
+
+.divider span {
+    background-color: #1e293b; /* Cor de fundo da seção auth (ou similar) */
+    padding: 0 10px;
+    position: relative;
+    z-index: 2;
+}
+
+.divider::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: #334155; /* slate-700 */
+    z-index: 1;
+}
+
+.footer-text {
+    text-align: center;
+    font-size: 14px;
+    color: #94a3b8; /* slate-400 */
+}
+
+.footer-text a {
+    color: #fcd34d; /* yellow-400 */
+    text-decoration: none;
+    font-weight: 600;
+}
+.footer-text a:hover {
+    text-decoration: underline;
+}
+
+/* --- Caixas de Mensagem (Feedback) --- */
+/* Estas classes correspondem às usadas em getMessageClass no JS */
+.info-box {
+    padding: 15px;
+    border-radius: 8px; /* rounded-lg */
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 1rem; /* Adicionado espaço abaixo */
+}
+
+/* Info (Azul) */
+.info-box-info {
+    background-color: #1e3a8a; /* blue-900 */
+    color: #93c5fd; /* blue-300 */
+    border: 1px solid #2563eb; /* blue-600 */
+}
+
+/* Success (Verde) */
+.info-box-success {
+    background-color: #064e3b; /* green-900 */
+    color: #6ee7b7; /* green-300 */
+    border: 1px solid #10b981; /* green-600 */
+}
+
+/* Error (Vermelho) */
+.info-box-error {
+    background-color: #7f1d1d; /* red-900 */
+    color: #fca5a5; /* red-300 */
+    border: 1px solid #ef4444; /* red-500 */
+}
+
+
+/* --- Responsividade --- */
+@media (max-width: 768px) {
+    .container {
+        flex-direction: column;
+        width: 95%;
+        margin-top: 2rem; /* Adiciona espaço no topo em telas menores */
+        margin-bottom: 2rem;
+    }
+    .logo-section {
+        border-radius: 20px 20px 0 0; /* Apenas cantos superiores arredondados */
+        border-bottom-left-radius: 0;
+        padding: 30px; /* Reduz padding */
+    }
+    .auth-section {
+        border-top-left-radius: 0;
+        border-top-right-radius: 0; /* Garante que não haja bordas estranhas */
+        border-bottom-left-radius: 20px;
+        border-bottom-right-radius: 20px;
+        padding: 30px; /* Reduz padding */
+    }
+    .tribal-icon {
+        font-size: 60px; /* Reduz tamanho do ícone */
+    }
+    .logo-title {
+        font-size: 28px; /* Reduz tamanho do título */
+    }
+}

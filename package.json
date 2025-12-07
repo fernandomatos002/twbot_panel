@@ -1,0 +1,97 @@
+{
+  "name": "twbot_desktop_app",
+  "version": "1.0.0",
+  "description": "TWBot Desktop App",
+  "type": "module",
+  "main": "dist/main/index.cjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SEU_USUARIO_GITHUB/NOME_DO_REPOSITORIO.git"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "cross-env NODE_ENV=development vite",
+    "compile:jsc": "electron ./compile-in-electron.cjs",
+    "dev:electron": "cross-env NODE_ENV=development electron src/main/index.cjs",
+    "start": "concurrently \"npm:dev\" \"npm:dev:electron\"",
+    "build:vite": "vite build",
+    "build:backend": "node ./compile-in-electron.cjs",
+    "build:pack": "electron-builder",
+    "build": "npm run build:vite && npm run build:backend && node copy-preload.cjs && npm run build:pack",
+    "compile:vps": "node ./compilar_vps.js"
+  },
+  "keywords": [
+    "react",
+    "electron",
+    "vite",
+    "tailwind"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@heroicons/react": "^2.2.0",
+    "axios": "^1.12.2",
+    "axios-retry": "^4.5.0",
+    "bytenode": "^1.5.7",
+    "cheerio": "^1.1.2",
+    "electron-store": "^7.0.3",
+    "electron-updater": "^6.1.7",
+    "lucide-react": "^0.309.0",
+    "playwright": "^1.56.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "react": "^18.2.0",
+    "react-beautiful-dnd": "^13.1.1",
+    "react-dom": "^18.2.0",
+    "undici": "^5.29.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^8.2.2",
+    "cross-env": "^10.1.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.4.0",
+    "vite": "^5.0.8",
+    "wait-on": "^7.2.0"
+  },
+  "overrides": {
+    "undici": "^5.29.0"
+  },
+  "build": {
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "SEU_USUARIO_GITHUB",
+        "repo": "NOME_DO_REPOSITORIO"
+      }
+    ],
+    "appId": "com.twbot.desktop.app",
+    "productName": "TWBot Painel",
+    "files": [
+      "dist/main/**/*",
+      "dist-renderer/**/*",
+      "dist/preload/**/*",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "asar": false,
+    "directories": {
+      "output": "release-builds"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
