@@ -19,13 +19,11 @@ async function loginAndSelectWorld(config) {
 
         if (proxyConfig && proxyConfig.server) {
             console.log(`[authService-${accountId}] Configurando proxy: ${proxyConfig.server}`);
-            
             const proxySettings = {
                 server: proxyConfig.server, 
                 username: proxyConfig.username,
                 password: proxyConfig.password
             };
-            
             ipcService.sendStatus('INICIANDO...', 'Testando proxy...');
             
             const isProxyOk = await testProxy(proxySettings, accountId);
@@ -42,8 +40,7 @@ async function loginAndSelectWorld(config) {
 
         ipcService.sendStatus('INICIANDO...', 'Lançando navegador...');
         browser = await chromium.launch({ 
-            headless: true,
-            channel: 'chrome'
+            headless: true
         });
 
         context = await browser.newContext(contextOptions);
@@ -107,14 +104,12 @@ async function loginAndSelectWorld(config) {
 async function handleWorldSelect(page, worldSelector, gameSelector, accountId, villageId) {
     console.log(`[authService-${accountId}] Selecionando mundo...`);
     ipcService.sendStatus('INICIANDO...', `Selecionando mundo...`);
-    
     const worldLinkHandle = await page.waitForSelector(worldSelector, { state: 'attached', timeout: 15000 });
-    
+
     await Promise.all([
         page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }),
         worldLinkHandle.click({ timeout: 15000, force: true })
     ]);
-    
     console.log(`[authService-${accountId}] Navegação de mundo concluída.`);
 
     const dailyBonusPopupSelector = '#popup_box_daily_bonus';
@@ -129,7 +124,6 @@ async function handleWorldSelect(page, worldSelector, gameSelector, accountId, v
         ipcService.sendStatus('EM_EXECUÇÃO', 'Lidando com bônus diário...');
         
         const bonusDisappearPromise = page.waitForSelector(dailyBonusPopupSelector, { state: 'hidden', timeout: 60000 });
-        
         try {
             await openBonusButtonLocator.waitFor({ state: 'visible', timeout: 10000 });
             await openBonusButtonLocator.click({ timeout: 15000, force: true });
@@ -161,10 +155,8 @@ async function handleAlreadyInGame(page, gameSelector, accountId, villageId, nav
     }
     
     const finalGameData = await page.evaluate(() => typeof window.game_data !== 'undefined' ? window.game_data : null);
-    
     if (finalGameData && finalGameData.village && String(finalGameData.village.id) !== String(villageId)) {
         console.warn(`[authService-${accountId}] Aldeia atual (${finalGameData.village.id}) não é a alvo (${villageId}). Navegando...`);
-        
         const correctVillageUrl = page.url().replace(/village=\d+/, `village=${villageId}`);
         await page.goto(correctVillageUrl, { waitUntil: 'load', timeout: 30000 });
         await page.waitForSelector(gameSelector, { timeout: 30000 });

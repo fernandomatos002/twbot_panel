@@ -1,0 +1,5269 @@
+ESTRUTURA DO PROJETO TRIBAL WARS BOT
+========================================
+
+
+====================
+ARQUIVO: .\authentication-worker.cjs
+====================
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+
+let config = null;
+let browser = null;
+let context = null;
+let page = null;
+let isExiting = false;
+
+function sendStatus(message) {
+    if (!config?.accountId || !process.connected || isExiting) {
+        return;
+    }
+    try {
+        process.send({
+            type: 'status',
+            payload: { message }
+        });
+    } catch (ipcError) {
+        console.warn(`[AuthWorker-${config.accountId}] Falha ao enviar status IPC: ${ipcError.message}`);
+    }
+}
+
+async function sendResultAndExit(payload) {
+    if (isExiting) return;
+    isExiting = true;
+
+    if (page) {
+        try { await page.close(); } catch (e) { }
+        page = null;
+    }
+    if (context) {
+        try { await context.close(); } catch (e) { }
+        context = null;
+    }
+    if (browser) {
+        try { await browser.close(); } catch (e) { }
+        browser = null;
+    }
+
+    if (process.connected) {
+        try {
+            process.send({ type: 'result', payload });
+        } catch (ipcError) {
+            console.error(`[AuthWorker-${config?.accountId || 'UKN'}] Falha ao enviar resultado IPC: ${ipcError.message}`);
+        }
+    }
+
+    process.exit(payload.success ? 0 : 1);
+}
+
+async function runAuthentication(receivedConfig) {
+    config = receivedConfig;
+    const { accountId, loginUrl, gameUrlPattern, proxyConfig } = config;
+
+    if (!accountId || !loginUrl || !gameUrlPattern) {
+        await sendResultAndExit({ success: false, error: 'Configuração inválida.' });
+        return;
+    }
+
+    try {
+        sendStatus('Abrindo navegador...');
+        browser = await chromium.launch({
+            headless: false,
+            channel: 'chrome',
+            proxy: proxyConfig || undefined
+        });
+
+        browser.on('disconnected', async () => {
+            if (!isExiting) {
+                await sendResultAndExit({ success: false, error: 'Autenticação cancelada (navegador fechado).' });
+            }
+        });
+
+        context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        });
+
+        page = await context.newPage();
+
+        await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        sendStatus('Aguardando login manual na janela do navegador...');
+        
+        const navigationTimeout = 300000;
+        await page.waitForURL(new RegExp(gameUrlPattern.replace(/\*/g, '.*')), { timeout: navigationTimeout });
+
+        sendStatus('Login detectado! Extraindo dados da aldeia...');
+        await page.waitForTimeout(2000);
+
+        let villageData = null;
+        try {
+            await page.waitForFunction("window.game_data && window.game_data.village && window.game_data.village.id", { timeout: 15000 });
+            
+            villageData = await page.evaluate(`
+                (() => {
+                    if (window.game_data && window.game_data.village) {
+                        return {
+                            id: window.game_data.village.id,
+                            name: window.game_data.village.name
+                        };
+                    }
+                    return null;
+                })()
+            `);
+        } catch (waitError) {
+             try {
+                const screenshotsDir = path.join(process.cwd(), 'screenshots');
+                if (!fs.existsSync(screenshotsDir)){
+                    fs.mkdirSync(screenshotsDir);
+                }
+                const screenshotPath = path.join(screenshotsDir, `error_no_gamedata_${accountId}_${Date.now()}.png`);
+                await page.screenshot({ path: screenshotPath });
+             } catch(ssError) { }
+             throw new Error(`Não foi possível encontrar os dados da aldeia: ${waitError.message}`);
+        }
+
+        if (!villageData || !villageData.id) {
+             throw new Error('Login detectado, mas não foi possível extrair o ID da aldeia (retornou nulo).');
+        }
+
+        sendStatus('Salvando sessão...');
+        await page.waitForTimeout(1000);
+
+        const cookies = await context.cookies();
+        if (!cookies || cookies.length === 0) {
+            throw new Error('Login detectado, mas não foi possível extrair os cookies.');
+        }
+
+        const finalPayload = {
+            success: true,
+            cookies: cookies,
+            villageId: villageData.id
+        };
+
+        await sendResultAndExit(finalPayload);
+
+    } catch (error) {
+        let errorMessage = error.message;
+        
+        try {
+            if (page && !page.isClosed()){
+                const screenshotsDir = path.join(process.cwd(), 'screenshots');
+                if (!fs.existsSync(screenshotsDir)){
+                    fs.mkdirSync(screenshotsDir);
+                }
+                const screenshotPath = path.join(screenshotsDir, `error_general_auth_${accountId}_${Date.now()}.png`);
+                await page.screenshot({ path: screenshotPath });
+            }
+         } catch(ssError) { }
+
+        if (error.name === 'TimeoutError' && error.message.includes('waitForURL')) {
+            errorMessage = 'Tempo limite excedido para login.';
+        } else if (error.message.includes('browser has been closed')) {
+            errorMessage = 'Autenticação cancelada (navegador fechado).';
+        }
+
+        await sendResultAndExit({ success: false, error: errorMessage });
+    }
+}
+
+process.on('message', (message) => {
+    if (isExiting) return;
+
+    if (message?.type === 'start') {
+        if (message.config) {
+            runAuthentication(message.config).catch(async (err) => {
+                await sendResultAndExit({ success: false, error: `Erro fatal: ${err.message || err}` });
+            });
+        } else {
+            sendResultAndExit({ success: false, error: 'Configuração ausente.' });
+        }
+    }
+});
+
+process.on('uncaughtException', async (error) => {
+    await sendResultAndExit({ success: false, error: `Erro fatal não capturado: ${error.message}` });
+});
+
+process.on('SIGTERM', async () => {
+    await sendResultAndExit({ success: false, error: 'Processo terminado externamente.' });
+});
+
+====================
+ARQUIVO: .\compile-in-electron.cjs
+====================
+const bytenode = require('bytenode');
+const fs = require('fs');
+const path = require('path');
+
+// Lê a versão do Electron para garantir compatibilidade
+const pkg = require('./package.json');
+const electronVersion = pkg.devDependencies.electron.replace('^', '').replace('~', '');
+console.log(`[Build] Target Electron Version: ${electronVersion}`);
+
+const mainDir = path.join(__dirname, 'src', 'main');
+const distDir = path.join(__dirname, 'dist', 'main');
+
+// 1. Arquivos para COMPILAR (Ofuscar -> .jsc)
+// Apenas arquivos que são carregados dinamicamente ou são Entry Points
+const FILES_TO_COMPILE = [
+    'index.cjs', // Se quiser ofuscar o main, senão mova para COPY
+    'apiService.cjs',
+    'updater.cjs',
+    'windowManager.cjs',
+    'workerManager.cjs',
+    // Workers (são chamados pelo workerManager que sabe lidar com .jsc)
+    'authentication-worker.cjs',
+    'core_automation-worker.cjs',
+    'village_viewer_worker.cjs'
+];
+
+// 2. Arquivos/Pastas para APENAS COPIAR (Manter .cjs)
+// Isso corrige o erro "Cannot find module", pois o código espera .cjs
+const DIRS_TO_COPY = [
+    'utils',
+    'automation_modules',
+    'worker_core' // Importante: Contém BotWorker, authService, etc.
+];
+
+// Função auxiliar para copiar pasta recursivamente
+function copyRecursiveSync(src, dest) {
+    const exists = fs.existsSync(src);
+    const stats = exists && fs.statSync(src);
+    const isDirectory = exists && stats.isDirectory();
+
+    if (isDirectory) {
+        if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
+        fs.readdirSync(src).forEach((childItemName) => {
+            copyRecursiveSync(path.join(src, childItemName), path.join(dest, childItemName));
+        });
+    } else {
+        if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+    }
+}
+
+(async () => {
+    console.log('[Build] Iniciando processo de build corrigido...');
+    
+    // Limpa dist
+    if (fs.existsSync(distDir)) {
+        fs.rmSync(distDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(distDir, { recursive: true });
+
+    // 1. Copia as dependências (.cjs) sem alterar
+    console.log('[Build] Copiando módulos e utilitários (mantendo .cjs)...');
+    for (const dir of DIRS_TO_COPY) {
+        const sourcePath = path.join(mainDir, dir);
+        const destPath = path.join(distDir, dir);
+        if (fs.existsSync(sourcePath)) {
+            copyRecursiveSync(sourcePath, destPath);
+            console.log(`   -> Copiado: ${dir}`);
+        } else {
+            console.warn(`   [AVISO] Pasta não encontrada: ${dir}`);
+        }
+    }
+
+    // 2. Compila os arquivos principais (.jsc)
+    console.log('[Build] Compilando Entry Points e Workers...');
+    for (const file of FILES_TO_COMPILE) {
+        const sourcePath = path.join(mainDir, file);
+        const destPathJSC = path.join(distDir, file.replace(/\.cjs$/, '.jsc'));
+        
+        // Nota: Para o index.cjs, geralmente mantemos uma cópia .cjs de loader ou compilamos.
+        // Se compilarmos o index.cjs, precisamos garantir que o package.json aponte para index.jsc ou ter um loader.
+        // Para simplificar, se for index.cjs, vamos apenas copiar, a menos que você tenha um loader externo.
+        if (file === 'index.cjs') {
+            fs.copyFileSync(sourcePath, path.join(distDir, file));
+            console.log(`   -> Copiado (Loader): ${file}`);
+            continue;
+        }
+
+        if (fs.existsSync(sourcePath)) {
+            try {
+                await bytenode.compileFile({
+                    filename: sourcePath,
+                    output: destPathJSC,
+                    electron: true,
+                    electronVersion: electronVersion
+                });
+                console.log(`   -> Ofuscado: ${file}`);
+            } catch (err) {
+                console.error(`   [ERRO] Falha ao ofuscar ${file}:`, err.message);
+            }
+        } else {
+            console.warn(`   [AVISO] Arquivo não encontrado: ${file}`);
+        }
+    }
+    
+    console.log('[Build] Concluído! Dependências .cjs preservadas.');
+})();
+
+====================
+ARQUIVO: .\copy-preload.cjs
+====================
+const fs = require('fs');
+const path = require('path');
+
+const src = path.join(__dirname, 'src', 'preload', 'preload.cjs');
+const destDir = path.join(__dirname, 'dist', 'preload');
+const dest = path.join(destDir, 'preload.cjs');
+
+console.log('[CopyPreload] Copiando preload...');
+
+if (!fs.existsSync(src)) {
+    console.error('[Erro] Arquivo preload não encontrado em:', src);
+    process.exit(1);
+}
+
+if (!fs.existsSync(destDir)) {
+    fs.mkdirSync(destDir, { recursive: true });
+}
+
+fs.copyFileSync(src, dest);
+console.log('[CopyPreload] Sucesso! Copiado para:', dest);
+
+====================
+ARQUIVO: .\dummy-worker.js
+====================
+// dummy-worker.js
+
+/**
+ * Worker para execução de automações (Versão com controle de parada).
+ * Simula a execução de um bot, gerencia seu ciclo de vida e responde ao comando 'stop'.
+ */
+
+// Simula os estados de status (deve corresponder aos usados no frontend)
+const STATUS = {
+    INITIALIZING: 'INICIANDO...',
+    RUNNING: 'EM_EXECUÇÃO',
+    STOPPING: 'PARANDO...',
+    STOPPED: 'PARADO',
+    SESSION_MISSING: 'SESSÃO_AUSENTE', // Exemplo de erro inicial
+    FAILURE: 'FALHA!' // Erro genérico ou crash
+};
+
+let isRunning = false;
+let accountId = null;
+let simulationIntervalId = null; // ID do intervalo da simulação principal
+
+// --- Função Auxiliar para Envio de Status ---
+
+/**
+ * Envia um objeto de status padronizado para o processo principal (Main Process).
+ * @param {string} status - O novo status (e.g., STATUS.RUNNING).
+ * @param {string} [log=''] - Uma mensagem de log opcional.
+ */
+const sendStatusUpdate = (status, log = '') => {
+    // Verifica se process.send está disponível (confirmação de execução como child process)
+    if (process.send) {
+        process.send({
+            type: 'statusUpdate', // Identificador da mensagem
+            accountId: accountId, // ID da conta associada
+            status: status,       // O estado atual
+            log: log,             // Mensagem descritiva
+            timestamp: new Date().toISOString() // Data/Hora do evento
+        });
+    } else {
+        // Loga no console do worker se IPC não estiver disponível (não deve acontecer em uso normal)
+        console.error(`[Worker-${accountId || 'unknown'}] Erro: Tentativa de enviar status, mas process.send não está disponível.`);
+    }
+};
+
+// --- Funções de Controle da Automação ---
+
+/**
+ * Inicia a simulação principal do bot.
+ * @param {object} config - Configuração recebida do Main Process ({ accountId, session }).
+ */
+const startAutomation = (config) => {
+    accountId = config.accountId; // Armazena globalmente no worker para referência
+
+    // Verifica a sessão (exemplo)
+    if (!config.session || config.session.length === 0) {
+        console.error(`[Worker-${accountId}] Erro Crítico: Sessão (cookies) não fornecida ou vazia.`);
+        sendStatusUpdate(STATUS.SESSION_MISSING, 'Erro: Dados de sessão ausentes. Autentique novamente.');
+        process.exit(1); // Encerra com código de erro
+        return;
+    }
+
+    isRunning = true;
+    console.log(`[Worker-${accountId}] (PID: ${process.pid}) Iniciando simulação com ${config.session.length} cookies.`);
+    sendStatusUpdate(STATUS.INITIALIZING, `Inicializando bot para ${accountId}...`);
+
+    // Simula um tempo de inicialização
+    setTimeout(() => {
+        sendStatusUpdate(STATUS.RUNNING, 'Automação iniciada e em execução (simulada).');
+
+        let cycleCount = 0;
+        // Inicia o loop de simulação de tarefas
+        simulationIntervalId = setInterval(() => {
+            cycleCount++;
+            const logMessage = `Ciclo ${cycleCount}: Verificando recursos e tropas (simulado)...`;
+            console.log(`[Worker-${accountId}] ${logMessage}`);
+            sendStatusUpdate(STATUS.RUNNING, logMessage);
+
+            // Simula uma falha aleatória para teste
+            if (Math.random() < 0.05) { // 5% de chance de falha por ciclo
+                console.error(`[Worker-${accountId}] Erro simulado durante a execução!`);
+                sendStatusUpdate(STATUS.FAILURE, 'Erro simulado: Falha ao processar dados da aldeia.');
+                clearInterval(simulationIntervalId); // Para o loop
+                isRunning = false;
+                process.exit(1); // Encerra com erro
+            }
+
+        }, 8000); // Simula uma tarefa a cada 8 segundos
+
+    }, 2000); // 2 segundos de inicialização simulada
+};
+
+/**
+ * Executa a rotina de parada limpa da automação.
+ */
+const stopAutomationCleanly = () => {
+    if (!isRunning) {
+        console.log(`[Worker-${accountId}] Recebido comando 'stop', mas já não estava em execução.`);
+        // Garante que o status 'PARADO' seja enviado caso algo tenha dado errado antes
+        sendStatusUpdate(STATUS.STOPPED, 'Já estava parado.');
+        process.exit(0);
+        return;
+    }
+
+    console.log(`[Worker-${accountId}] Recebido comando 'stop'. Iniciando parada limpa...`);
+    isRunning = false; // Sinaliza que não deve mais executar tarefas
+
+    // 1. Limpa o intervalo da simulação principal
+    if (simulationIntervalId) {
+        clearInterval(simulationIntervalId);
+        simulationIntervalId = null;
+    }
+
+    // 2. Envia o status 'PARANDO...' para o Main Process/Frontend
+    sendStatusUpdate(STATUS.STOPPING, 'Finalizando tarefas e salvando estado...');
+
+    // 3. Simula o tempo necessário para limpeza (ex: fechar conexão, salvar dados)
+    setTimeout(() => {
+        console.log(`[Worker-${accountId}] Limpeza concluída.`);
+
+        // 4. Envia o status final 'PARADO'
+        sendStatusUpdate(STATUS.STOPPED, 'Automação encerrada de forma limpa.');
+
+        // 5. Encerra o processo do worker com sucesso
+        process.exit(0);
+
+    }, 2500); // Simula 2.5 segundos de limpeza
+};
+
+
+// --- Ponto de Entrada e Listeners de Comunicação e Erro ---
+
+// Listener principal para mensagens do Main Process ('start' ou 'stop')
+process.on('message', (message) => {
+  if (!message || typeof message.type !== 'string') {
+      console.error('[Worker] Mensagem inválida recebida do Main Process:', message);
+      return;
+  }
+
+  console.log(`[Worker${accountId ? `-${accountId}` : ''}] Mensagem recebida: tipo='${message.type}'`);
+
+  if (message.type === 'start' && !isRunning) {
+    if (!message.config || !message.config.accountId) {
+         console.error('[Worker] Comando "start" recebido sem config.accountId.');
+         sendStatusUpdate(STATUS.FAILURE, 'Erro interno: Dados de configuração ausentes no comando start.');
+         process.exit(1);
+         return;
+    }
+    startAutomation(message.config);
+  } else if (message.type === 'start' && isRunning) {
+      console.warn(`[Worker-${accountId}] Recebido comando 'start', mas a automação já está rodando.`);
+  } else if (message.type === 'stop') {
+    stopAutomationCleanly();
+  } else {
+      console.warn(`[Worker${accountId ? `-${accountId}` : ''}] Recebido tipo de mensagem não reconhecido: ${message.type}`);
+  }
+});
+
+// Listener para exceções não capturadas
+process.on('uncaughtException', (err) => {
+  const errorMsg = `Exceção não tratada: ${err.message || err}`;
+  console.error(`[Worker-${accountId || 'init'}] ${errorMsg}`, err.stack);
+  // Tenta enviar um status de falha antes de sair
+  sendStatusUpdate(STATUS.FAILURE, errorMsg);
+  // Espera um pouco para dar chance da mensagem IPC ser enviada
+  setTimeout(() => process.exit(1), 500);
+});
+
+// Listener para promessas rejeitadas não tratadas
+process.on('unhandledRejection', (reason, promise) => {
+  const errorMsg = `Rejeição de promessa não tratada: ${reason instanceof Error ? reason.message : reason}`;
+  console.error(`[Worker-${accountId || 'init'}] ${errorMsg}`, reason);
+  // Tenta enviar um status de falha antes de sair
+  sendStatusUpdate(STATUS.FAILURE, errorMsg);
+  // Espera um pouco para dar chance da mensagem IPC ser enviada
+  setTimeout(() => process.exit(1), 500);
+});
+
+// Log inicial para indicar que o script do worker foi carregado e está pronto
+console.log(`[Worker (PID: ${process.pid})] Script carregado. Aguardando comando 'start' ou 'stop'.`);
+
+====================
+ARQUIVO: .\dummy.js
+====================
+// --- LINHA DE DEPURAÇÃO ADICIONADA ---
+console.log('[Worker] Script iniciado.');
+// --- FIM DA LINHA DE DEPURAÇÃO ---
+
+// dummy-worker.js
+
+// REMOVIDO: require('bytenode'); // <-- ESTA LINHA DEVE SER REMOVIDA!
+
+/**
+ * Função principal do worker manequim.
+ * Simula o recebimento de dados e o envio de status.
+ * @param {string} accountId - O ID da conta recebido.
+ * @param {object} session - O objeto de sessão (cookies) recebido.
+ */
+const runBotSimulation = (accountId, session) => {
+  // Verifica se 'process.send' existe (confirma que está rodando como um processo 'fork')
+  if (!process.send) {
+    console.error(`[Worker-${accountId}] Erro: Não está rodando como um processo filho (IPC indisponível).`);
+    process.exit(1); // Sai com código de erro
+    return;
+  }
+
+  console.log(`[Worker-${accountId}] (PID: ${process.pid}) Processo iniciado com sucesso.`);
+
+  // 1. Envia o primeiro status de volta para o 'main/index.cjs'
+  // 'main/index.cjs' captura isso com 'child.on('message', ...)'
+  process.send({
+    status: 'Iniciado (Manequim)',
+    log: `Worker recebendo dados para a conta ${accountId}. Sessão com ${session.length} cookies.`
+  });
+
+  // 2. Simula algum trabalho (ex: 5 segundos)
+  setTimeout(() => {
+    console.log(`[Worker-${accountId}] Simulação de tarefa concluída.`);
+
+    // 3. Envia o status final
+    process.send({
+      status: 'OFF', // Usamos 'OFF' para indicar conclusão limpa (main/index.cjs tratará isso)
+      log: 'Trabalho manequim finalizado com sucesso.'
+    });
+
+    // 4. Encerra o processo filho
+    process.exit(0); // 0 indica saída bem-sucedida
+
+  }, 5000); // Simula 5 segundos de trabalho
+};
+
+// --- Ponto de Entrada do Processo Filho ---
+
+// Escuta a mensagem enviada pelo 'child.send(...)' no 'main/index.cjs'
+process.on('message', (message) => {
+  console.log(`[Worker] Mensagem recebida do Main: ${message.type}`);
+
+  if (message.type === 'start') {
+    const { accountId, session } = message;
+
+    if (!accountId || !session) {
+      const errorMsg = '[Worker] Erro: accountId ou session não recebidos.';
+      console.error(errorMsg);
+      if(process.send) {
+        process.send({ status: 'CRASHED', log: errorMsg });
+      }
+      process.exit(1); // 1 indica saída com erro
+      return;
+    }
+
+    // Inicia a simulação
+    runBotSimulation(accountId, session);
+  }
+});
+
+// Tratadores de segurança para garantir que o 'main' seja notificado em caso de falha
+process.on('uncaughtException', (err) => {
+  const errorMsg = `[Worker] Exceção não tratada: ${err.message}`;
+  console.error(errorMsg);
+  if (process.send) {
+    process.send({ status: 'CRASHED', log: errorMsg });
+  }
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const errorMsg = `[Worker] Rejeição não tratada: ${reason.message || reason}`;
+  console.error(errorMsg);
+  if (process.send) {
+    process.send({ status: 'CRASHED', log: errorMsg });
+  }
+  process.exit(1);
+});
+
+
+====================
+ARQUIVO: .\index.html
+====================
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TWBot Desktop App</title> 
+    
+    <link rel="stylesheet" href="/src/index.css" />
+
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' http://localhost:5173; style-src 'self' 'unsafe-inline';" />
+  </head>
+  <body>
+    <div id="root"></div>
+    
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+====================
+ARQUIVO: .\package.json
+====================
+{
+  "name": "twbot_desktop_app",
+  "version": "1.0.0",
+  "description": "TWBot Desktop App",
+  "type": "module",
+  "main": "dist/main/index.cjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fernandomatos002/twbot_panel.git"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "cross-env NODE_ENV=development vite",
+    "compile:jsc": "electron ./compile-in-electron.cjs",
+    "dev:electron": "cross-env NODE_ENV=development electron src/main/index.cjs",
+    "start": "concurrently \"npm:dev\" \"npm:dev:electron\"",
+    "build:vite": "vite build",
+    "build:backend": "node ./compile-in-electron.cjs",
+    "build:pack": "electron-builder",
+    "build": "npm run build:vite && npm run build:backend && node copy-preload.cjs && npm run build:pack",
+    "compile:vps": "node ./compilar_vps.js"
+  },
+  "keywords": [
+    "react",
+    "electron",
+    "vite",
+    "tailwind"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@heroicons/react": "^2.2.0",
+    "axios": "^1.12.2",
+    "axios-retry": "^4.5.0",
+    "bytenode": "^1.5.7",
+    "cheerio": "^1.1.2",
+    "electron-store": "^7.0.3",
+    "electron-updater": "^6.6.2",
+    "lucide-react": "^0.309.0",
+    "playwright": "^1.56.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "react": "^18.2.0",
+    "react-beautiful-dnd": "^13.1.1",
+    "react-dom": "^18.2.0",
+    "undici": "^5.29.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^8.2.2",
+    "cross-env": "^10.1.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.4.0",
+    "update-electron-app": "^3.1.1",
+    "vite": "^5.0.8",
+    "wait-on": "^7.2.0"
+  },
+  "overrides": {
+    "undici": "^5.29.0"
+  },
+  "build": {
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "fernandomatos002",
+        "repo": "twbot_panel"
+      }
+    ],
+    "appId": "com.twbot.desktop.app",
+    "productName": "TWBot Painel",
+    "files": [
+      "dist/main/**/*",
+      "dist-renderer/**/*",
+      "dist/preload/**/*",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "asar": false,
+    "directories": {
+      "output": "release-builds"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
+
+====================
+ARQUIVO: .\postcss.config.cjs
+====================
+        module.exports = {
+          plugins: {
+            tailwindcss: {},
+            autoprefixer: {},
+          },
+        };
+
+
+====================
+ARQUIVO: .\tailwind.config.cjs
+====================
+        // tailwind.config.cjs
+        /** @type {import('tailwindcss').Config} */
+        module.exports = { // <-- Mude "export default" para "module.exports ="
+          content: [
+            "./index.html",
+            "./src/**/*.{js,ts,jsx,tsx}",
+          ],
+          theme: {
+            extend: {},
+          },
+          plugins: [],
+        }
+
+
+====================
+ARQUIVO: .\versions.json
+====================
+{
+  "dummy": "1.0.0",
+  "farm": "0.0.0",
+  "build": "0.0.0"
+}
+
+
+====================
+ARQUIVO: .\vite.config.js
+====================
+    // vite.config.js
+
+    import { defineConfig } from 'vite'
+    import react from '@vitejs/plugin-react'
+    import tailwindcss from 'tailwindcss' // Importa o TailwindCSS
+    import autoprefixer from 'autoprefixer' // Importa o Autoprefixer
+
+    // https://vitejs.dev/config/
+    export default defineConfig({
+      // Adiciona a configuração de servidor para garantir que o Electron
+      // saiba onde o dev:vite está rodando (porta 5173).
+      server: {
+        port: 5173,
+      },
+
+      // 1. Crucial para o Electron: garante que os caminhos sejam relativos.
+      base: './',
+
+      plugins: [react()],
+
+      // === NOVA SEÇÃO: Configuração do PostCSS diretamente no Vite ===
+      css: {
+        postcss: {
+          plugins: [
+            tailwindcss(), // Chama o plugin TailwindCSS
+            autoprefixer(), // Chama o plugin Autoprefixer
+          ],
+        },
+      },
+      // =============================================================
+
+      // 2. Configurações para o build final
+      build: {
+        // Diretório onde o Vite colocará o build final (frontend)
+        outDir: 'dist-renderer',
+        emptyOutDir: true,
+      },
+    })
+
+
+====================
+ARQUIVO: .\backend\db.js
+====================
+// /twbot_panel/backend/db.js
+// (v18) - Módulo de Conexão do Banco de Dados
+const { Pool } = require('pg');
+
+const pool = new Pool({
+    user: process.env.DB_USER,
+    host: process.env.DB_HOST,
+    database: process.env.DB_DATABASE,
+    password: process.env.DB_PASSWORD,
+    port: process.env.DB_PORT,
+});
+
+pool.connect((err, client, release) => {
+    if (err) {
+        console.error('FATAL: Erro ao conectar ao banco de dados:', err.stack);
+    } else {
+        console.log('Conectado ao PostgreSQL com sucesso!');
+        release();
+    }
+});
+
+module.exports = pool;
+
+====================
+ARQUIVO: .\backend\package.json
+====================
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.12.2",
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.3",
+    "uuid": "^13.0.0"
+  }
+}
+
+
+====================
+ARQUIVO: .\backend\proxyService.js
+====================
+// proxyService.js
+const axios = require('axios');
+// REMOVIDO: 'http' e 'https' nativos não são mais necessários para o agent
+// const http = require('http');
+// const https = require('https');
+
+// NOVO: Importa o HttpsProxyAgent
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+// REMOVIDO: Os agents nativos (httpAgent, httpsAgent) foram removidos
+
+// API GeoIP simples (sem necessidade de chave)
+const GEOIP_URL = 'http://ip-api.com/json/';
+
+/**
+ * Busca o país de origem de um endereço IP.
+ * @param {string} ip - O endereço IP do proxy.
+ * @returns {string} O código do país (ex: 'US', 'BR') ou 'Desconhecido'.
+ */
+async function fetchProxyCountry(ip) {
+    try {
+        // NÃO usamos proxy para esta requisição
+        const response = await axios.get(`${GEOIP_URL}${ip}`, {
+            timeout: 5000
+            // Agents removidos, usa o padrão do axios para esta chamada simples
+        });
+
+        if (response.data.status === 'success') {
+            return response.data.countryCode || response.data.country || 'N/A';
+        }
+    } catch (error) {
+        console.error(`[GeoIP] Falha ao buscar país para ${ip}:`, error.message);
+    }
+    return 'Desconhecido';
+}
+
+
+/**
+ * Tenta fazer uma requisição HTTP via proxy, busca GeoIP e atualiza o status no PostgreSQL.
+ * @param {object} proxy - Dados completos do proxy { id, ip, port, username, password }.
+ * @param {object} pgPool - O Pool de Conexões do PostgreSQL.
+ */
+async function testAndStoreProxyStatus(proxy, pgPool) {
+    const { id, ip, port, username, password } = proxy;
+    let newStatus = 'Falha';
+
+    // (Lógica de busca de país inalterada)
+    let country = proxy.country || null;
+    if (country === null || country === 'Desconhecido') {
+         console.log(`[ProxyTest] País não fornecido, buscando para ${ip}...`);
+         country = await fetchProxyCountry(ip);
+    } else {
+         console.log(`[ProxyTest] País já conhecido: ${country}`);
+    }
+
+
+    console.log(`[ProxyTest] Iniciando teste para ${ip}:${port} (${country})...`);
+
+    // --- 1. Teste de Conexão ---
+    try {
+        
+        // =================================================================
+        // CORREÇÃO: Usando HttpsProxyAgent para resolver EPROTO
+        // =================================================================
+        
+        // 1. Constrói a URL do proxy no formato que o HttpsProxyAgent espera
+        // Ex: "http://1.2.3.4:8080" ou "http://user:pass@1.2.3.4:8080"
+        let proxyUrl;
+        if (username && password) {
+            proxyUrl = `http://${username}:${password}@${ip}:${port}`;
+        } else {
+            proxyUrl = `http://${ip}:${port}`;
+        }
+        
+        // 2. Cria uma instância do HttpsProxyAgent
+        // O HttpsProxyAgent fará o "tunneling" da nossa requisição HTTPS (google)
+        // através do proxy (que é http ou https, não importa para ele)
+        const proxyAgent = new HttpsProxyAgent(proxyUrl);
+
+        const testUrl = 'https://www.google.com'; 
+
+        const response = await axios.get(testUrl, {
+            timeout: 15000,
+            
+            // 3. Informa ao Axios para usar este agente APENAS para HTTPS
+            // O `httpAgent` nativo será usado para HTTP
+            httpsAgent: proxyAgent,
+            
+            // 4. REMOVE a chave 'proxy' nativa do axios, pois o agent já cuida disso.
+            // proxy: { ... } // <-- REMOVIDO
+        });
+        
+        // =================================================================
+        
+        if (response.status >= 200 && response.status < 400) {
+            newStatus = 'Ativo';
+        } else {
+            newStatus = `Falha (HTTP ${response.status})`;
+        }
+
+    } catch (error) {
+        // Log detalhado do erro
+        const errorCode = error.code || (error.response ? `HTTP ${error.response.status}` : 'Erro Desconhecido');
+        
+        if (error.response && error.response.status === 400) {
+            newStatus = 'Falha (Erro: ERR_BAD_REQUEST)'; 
+        } else if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND') {
+            newStatus = 'Falha (Conexão)';
+        } else if (error.response && error.response.status === 407) {
+            newStatus = 'Falha (Auth Requerida)';
+        } else {
+             // Captura o EPROTO
+            newStatus = `Falha (Erro: ${errorCode}...)`;
+        }
+        // Loga a causa específica (EPROTO, ERR_BAD_REQUEST, ETIMEDOUT, etc.)
+        console.error(`[ProxyTest] Erro de Axios em ${ip}:${port}:`, errorCode, error.message);
+    }
+
+    // --- 2. Atualizar o Status Final e País no PostgreSQL ---
+    const updateQuery = `
+        UPDATE proxies
+        SET status = $1, last_tested_at = NOW(),
+            country = COALESCE($3, country) -- Atualiza o país SÓ SE $3 não for NULL
+        WHERE id = $2;
+    `;
+
+    try {
+        const result = await pgPool.query(updateQuery, [newStatus, id, country]);
+
+        if (result.rowCount === 0) {
+            console.error(`[DB Error] ATENÇÃO: Nenhum proxy encontrado com ID ${id} para atualização.`);
+        }
+
+        console.log(`[ProxyTest] DB ATUALIZADO para ${ip}:${port}. Status: ${newStatus}, País: ${country || '(mantido)'}`);
+    } catch (dbError) {
+        console.error(`[DB Error] FALHA AO ATUALIZAR STATUS do proxy ${id}:`, dbError.message);
+    } finally {
+        console.log(`[ProxyTest] FIM DA ROTINA assíncrona para ID: ${id}`);
+    }
+
+    // Retorna true/false para a rota JIT
+    return newStatus === 'Ativo';
+}
+
+
+// Exportação correta (mantida)
+module.exports = {
+    testAndStoreProxyStatus,
+    fetchProxyCountry
+};
+
+
+====================
+ARQUIVO: .\backend\server.js
+====================
+// /twbot_panel/backend/server.js
+// (v22) - CORRIGIDO: Corrige o conflito de rotas do Dashboard.
+// 1. Carrega variáveis de ambiente PRIMEIRO
+require('dotenv').config();
+
+// 2. Importa módulos principais
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+
+// 3. Importa o middleware de autenticação
+const authenticateToken = require('./middleware/authenticateToken');
+
+// 4. Inicializa o Express
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// 5. Configura Middlewares Globais
+app.use(cors());
+app.use(express.json()); // Importante vir ANTES das rotas
+
+// --- 6. Importa e Usa as Rotas ---
+
+// Rotas de Autenticação (Públicas)
+app.use('/api/auth', require('./routes/auth.js'));
+
+// Rotas de Automação (Download de Worker)
+app.use('/api/automation', authenticateToken, require('./routes/automation.js'));
+
+// Rota de Dados do Painel (Movido para um prefixo específico para evitar conflito com /api/tw-accounts)
+app.use('/api/data', require('./routes/dashboard.js')); // <-- CORRIGIDO AQUI
+
+// Rotas de Gerenciamento (CRUD)
+app.use('/api/tw-accounts', authenticateToken, require('./routes/twAccounts.js')); 
+app.use('/api/proxies', authenticateToken, require('./routes/proxies.js'));
+app.use('/api/construction-lists', authenticateToken, require('./routes/constructionLists.js'));
+app.use('/api/groups', authenticateToken, require('./routes/groups.js'));
+app.use('/api/recruitment-templates', authenticateToken, require('./routes/recruitmentTemplates.js'));
+
+
+// --- Rota Principal (Teste) ---
+app.get('/', (req, res) => res.send('Bem-vindo ao backend do TWBot Panel v21 (Refatorado)!'));
+
+// --- Inicialização do Servidor ---
+try {
+    app.listen(PORT, '0.0.0.0', () => { // Escuta em todas as interfaces
+        console.log(`Servidor v21 (Refatorado) rodando na porta ${PORT}`);
+    });
+} catch (error) {
+    console.error('FATAL: Falha ao iniciar o servidor Express:', error);
+    process.exit(1); 
+}
+
+====================
+ARQUIVO: .\src\index.css
+====================
+/* src/index.css - VERSÃO FINAL E LIMPA DO BLOCO PROBLEMÁTICO */
+/* Carrega as diretivas do Tailwind */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ajustes CSS Manuais */
+.recharts-wrapper, .recharts-surface {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* --- ESTILOS ADICIONADOS DO LOGINSCREEN.JSX --- */
+
+/* Keyframes para animação de partículas */
+@keyframes float {
+  0% {
+    transform: translateY(100vh) translateX(0) rotate(0deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.3;
+  }
+  90% {
+    opacity: 0.3;
+  }
+  100% {
+    transform: translateY(-100vh) translateX(100px) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+/* Keyframes para animação do logo */
+@keyframes float-logo {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-20px); }
+}
+
+/* Classe CSS pura para gradiente radial, usada no LoginScreen */
+.bg-gradient-radial {
+  background: radial-gradient(var(--tw-gradient-stops));
+}
+
+/* Correção de estilo para autofill de navegadores */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 30px rgba(255, 184, 0, 0.05) inset !important;
+  -webkit-text-fill-color: #e2e8f0 !important;
+}
+
+====================
+ARQUIVO: .\src\login.css
+====================
+/* login.css */
+/* REMOVIDAS: Diretivas do Tailwind já carregadas pelo index.css */
+
+/* --- ESTILOS ADICIONADOS DO LOGINSCREEN.JSX --- */
+
+/* Keyframes para animação de partículas */
+@keyframes float {
+  0% {
+    transform: translateY(100vh) translateX(0) rotate(0deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.3;
+  }
+  90% {
+    opacity: 0.3;
+  }
+  100% {
+    transform: translateY(-100vh) translateX(100px) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+/* Keyframes para animação do logo */
+@keyframes float-logo {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-20px); }
+}
+
+/* Classe CSS pura para gradiente radial, usada no LoginScreen */
+.bg-gradient-radial {
+  background: radial-gradient(var(--tw-gradient-stops));
+}
+
+/* Correção de estilo para autofill de navegadores */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 30px rgba(255, 184, 0, 0.05) inset !important;
+  -webkit-text-fill-color: #e2e8f0 !important; /* Cor do texto autofill */
+}
+
+/* --- Configuração de Fundo e Partículas (Visual Temático) --- */
+.login-wrapper {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Fundo escuro com gradiente */
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); /* Tailwind slate-900 to slate-800 */
+    position: relative;
+    overflow: hidden;
+    font-family: sans-serif; /* Ou sua fonte preferida */
+}
+
+/* Efeito de partículas (usando a classe 'animate-float' do Tailwind/keyframes) */
+.particles {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* --- Container Principal --- */
+.container {
+    position: relative;
+    z-index: 10;
+    display: flex;
+    flex-direction: row; /* Layout lado a lado */
+    max-width: 1000px;
+    width: 90%;
+    background: rgba(15, 23, 42, 0.6); /* Tailwind slate-900 com 60% opacidade */
+    border-radius: 20px; /* Ajuste conforme preferência */
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(5px);
+    border: 1px solid #334155; /* Tailwind slate-700 */
+}
+
+/* --- Seção de Logo/Design (Lateral Esquerda) --- */
+.logo-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+    text-align: center;
+    background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%); /* slate-800 to slate-900 */
+    border-top-left-radius: 20px;
+    border-bottom-left-radius: 20px;
+    color: #fcd34d; /* Tailwind yellow-400 */
+}
+
+.tribal-icon {
+    font-size: 80px;
+    margin-bottom: 10px;
+    text-shadow: 0 0 15px rgba(252, 211, 77, 0.7); /* Sombra amarela */
+    animation: float-logo 4s ease-in-out infinite; /* Aplica animação float */
+}
+
+.logo-title {
+    font-size: 32px;
+    font-weight: bold;
+    letter-spacing: 2px;
+}
+
+.decorative-line {
+    width: 50px;
+    height: 3px;
+    background-color: #fcd34d; /* yellow-400 */
+    margin: 15px 0;
+    box-shadow: 0 0 8px rgba(252, 211, 77, 0.5);
+}
+
+.logo-subtitle {
+    color: #94a3b8; /* slate-400 */
+    font-size: 14px;
+}
+
+/* --- Seção de Autenticação (Formulários) --- */
+.auth-section {
+    flex: 1;
+    padding: 40px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.card {
+    background: transparent; /* O fundo vem do .container */
+}
+
+/* --- Tabs de Navegação --- */
+.tabs {
+    display: flex;
+    margin-bottom: 25px;
+    border-bottom: 2px solid #334155; /* slate-700 */
+}
+
+.tab {
+    padding: 10px 20px;
+    border: none;
+    background: none;
+    color: #94a3b8; /* slate-400 */
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.3s, border-bottom 0.3s;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px; /* Para sobrepor a borda inferior do .tabs */
+}
+
+.tab.active {
+    color: #fcd34d; /* yellow-400 */
+    border-bottom-color: #fcd34d; /* yellow-400 */
+}
+
+/* --- Formulário e Elementos --- */
+.form {
+    display: none; /* Controlado pelo estado do React */
+    flex-direction: column;
+}
+
+.form.active {
+    display: flex; /* Controlado pelo estado do React */
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    color: #fcd34d; /* yellow-400 */
+    font-size: 14px;
+    margin-bottom: 8px;
+    font-weight: 600;
+}
+
+.form-group input[type="text"],
+.form-group input[type="email"],
+.form-group input[type="password"] {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid #475569; /* slate-600 */
+    border-radius: 8px; /* rounded-lg */
+    background-color: #1e293b; /* slate-800 */
+    color: #e2e8f0; /* slate-200 */
+    font-size: 16px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.form-group input:focus {
+    border-color: #fcd34d; /* yellow-400 */
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(252, 211, 77, 0.3); /* Sombra de foco amarela */
+}
+
+/* --- Botão Principal --- */
+.submit-btn {
+    width: 100%;
+    padding: 15px;
+    border: none;
+    border-radius: 12px; /* Um pouco mais arredondado */
+    font-size: 18px;
+    font-weight: bold;
+    cursor: pointer;
+    background: linear-gradient(90deg, #f59e0b, #eab308); /* Tailwind orange-500 to yellow-500 */
+    color: #111827; /* gray-900 */
+    transition: background 0.3s, transform 0.1s;
+    box-shadow: 0 5px 15px rgba(252, 211, 77, 0.4);
+}
+
+.submit-btn:hover {
+    background: linear-gradient(90deg, #fbbf24, #fde047); /* yellow-400 to yellow-300 */
+    transform: translateY(-1px);
+}
+
+/* --- Divisor e Footer --- */
+.divider {
+    text-align: center;
+    margin: 25px 0;
+    position: relative;
+    color: #64748b; /* slate-500 */
+}
+
+.divider span {
+    background-color: #1e293b; /* Cor de fundo da seção auth (ou similar) */
+    padding: 0 10px;
+    position: relative;
+    z-index: 2;
+}
+
+.divider::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: #334155; /* slate-700 */
+    z-index: 1;
+}
+
+.footer-text {
+    text-align: center;
+    font-size: 14px;
+    color: #94a3b8; /* slate-400 */
+}
+
+.footer-text a {
+    color: #fcd34d; /* yellow-400 */
+    text-decoration: none;
+    font-weight: 600;
+}
+.footer-text a:hover {
+    text-decoration: underline;
+}
+
+/* --- Caixas de Mensagem (Feedback) --- */
+/* Estas classes correspondem às usadas em getMessageClass no JS */
+.info-box {
+    padding: 15px;
+    border-radius: 8px; /* rounded-lg */
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 1rem; /* Adicionado espaço abaixo */
+}
+
+/* Info (Azul) */
+.info-box-info {
+    background-color: #1e3a8a; /* blue-900 */
+    color: #93c5fd; /* blue-300 */
+    border: 1px solid #2563eb; /* blue-600 */
+}
+
+/* Success (Verde) */
+.info-box-success {
+    background-color: #064e3b; /* green-900 */
+    color: #6ee7b7; /* green-300 */
+    border: 1px solid #10b981; /* green-600 */
+}
+
+/* Error (Vermelho) */
+.info-box-error {
+    background-color: #7f1d1d; /* red-900 */
+    color: #fca5a5; /* red-300 */
+    border: 1px solid #ef4444; /* red-500 */
+}
+
+
+/* --- Responsividade --- */
+@media (max-width: 768px) {
+    .container {
+        flex-direction: column;
+        width: 95%;
+        margin-top: 2rem; /* Adiciona espaço no topo em telas menores */
+        margin-bottom: 2rem;
+    }
+    .logo-section {
+        border-radius: 20px 20px 0 0; /* Apenas cantos superiores arredondados */
+        border-bottom-left-radius: 0;
+        padding: 30px; /* Reduz padding */
+    }
+    .auth-section {
+        border-top-left-radius: 0;
+        border-top-right-radius: 0; /* Garante que não haja bordas estranhas */
+        border-bottom-left-radius: 20px;
+        border-bottom-right-radius: 20px;
+        padding: 30px; /* Reduz padding */
+    }
+    .tribal-icon {
+        font-size: 60px; /* Reduz tamanho do ícone */
+    }
+    .logo-title {
+        font-size: 28px; /* Reduz tamanho do título */
+    }
+}
+
+====================
+ARQUIVO: .\src\main\apiService.cjs
+====================
+// src/main/apiService.js (NOVO)
+
+const axios = require('axios');
+const { default: axiosRetry } = require('axios-retry');
+
+// Comentário de Implementação:
+// Usamos variáveis de módulo para 'store', 'windowManager' e 'BACKEND_BASE_URL'.
+// Elas serão configuradas por uma função 'initApiService' chamada no 'index.cjs'.
+// Isso segue o padrão de Injeção de Dependência, tornando o módulo testável
+// e evitando dependências circulares ou globais.
+let store;
+let windowManager;
+let BACKEND_BASE_URL;
+
+// Flag para prevenir múltiplas tentativas de refresh simultâneas (race condition)
+let isRefreshing = false;
+// Fila para requisições que falharam com 401 enquanto um refresh estava em andamento
+let failedQueue = [];
+
+/**
+ * Processa a fila de requisições que falharam e as re-tenta com o novo token.
+ * @param {Error | null} error - O erro (se o refresh falhou) ou null (se teve sucesso)
+ * @param {string | null} token - O novo accessToken (se teve sucesso)
+ */
+function processQueue(error, token = null) {
+  failedQueue.forEach(prom => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+}
+
+/**
+ * Cria a instância principal do Axios ('api') com interceptadores.
+ * Esta instância lidará com todas as requisições autenticadas.
+ */
+const api = axios.create();
+
+// Aplica o 'axios-retry' apenas à instância 'api'
+axiosRetry(api, {
+  retries: 3,
+  retryDelay: (retryCount, error) => {
+    console.warn(`[AxiosRetry] Tentativa ${retryCount} falhou (${error.code || error.response?.status}). Aguardando ${retryCount * 2}s...`);
+    return retryCount * 2000;
+  },
+  // Não re-tenta em erros 401 (Unauthorized) ou 403 (Forbidden), 
+  // pois o interceptor de resposta cuidará do 401.
+  retryCondition: (error) => 
+    (axiosRetry.isNetworkError(error) || axiosRetry.isSafeRequestError(error) || error.response?.status >= 500) &&
+    error.response?.status !== 401 && 
+    error.response?.status !== 403
+});
+
+// === INTERCEPTOR DE REQUISIÇÃO (Request) ===
+// Injeta o 'authToken' do 'store' em todas as requisições
+api.interceptors.request.use(
+  (config) => {
+    if (!store) {
+      console.error("[apiService] Erro: store não inicializado.");
+      return Promise.reject(new Error("apiService não inicializado."));
+    }
+    const token = store.get('authToken');
+    if (token) {
+      config.headers['Authorization'] = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// === INTERCEPTOR DE RESPOSTA (Response) ===
+// Lida automaticamente com falhas 401 (Token Expirado)
+api.interceptors.response.use(
+  (response) => response, // Sucesso: não faz nada
+  async (error) => {
+    const originalRequest = error.config;
+    
+    // Se o erro NÃO for 401, ou já for uma tentativa de refresh, rejeita
+    if (error.response?.status !== 401 || originalRequest._retry) {
+      return Promise.reject(error);
+    }
+
+    // Se já houver um refresh em andamento, coloca esta requisição na fila
+    if (isRefreshing) {
+      return new Promise((resolve, reject) => {
+        failedQueue.push({ resolve, reject });
+      })
+      .then(token => {
+        // Quando o refresh terminar, re-tenta com o novo token
+        originalRequest.headers['Authorization'] = `Bearer ${token}`;
+        return api(originalRequest);
+      });
+    }
+
+    // Comentário de Implementação:
+    // Esta é a primeira requisição que falhou com 401.
+    // Inicia o processo de refresh.
+    originalRequest._retry = true;
+    isRefreshing = true;
+
+    const refreshToken = store.get('refreshToken');
+    if (!refreshToken) {
+      console.log("[apiService] 401 mas sem refreshToken. Forçando logout.");
+      isRefreshing = false;
+      store.delete('authToken');
+      if (windowManager) windowManager.sendForceLogout('Sessão expirada (sem refresh token).');
+      return Promise.reject(error);
+    }
+
+    try {
+      console.log("[apiService] Token expirado (401). Tentando refresh...");
+      // Usa a instância 'authApi' (sem interceptor) para evitar loop
+      const refreshResponse = await authApi.post('/api/auth/refresh', { refreshToken });
+
+      const newAccessToken = refreshResponse.data.accessToken;
+      if (!newAccessToken) {
+        throw new Error("Refresh token inválido ou não retornou accessToken.");
+      }
+
+      console.log("[apiService] Refresh bem-sucedido. Novo accessToken obtido.");
+      
+      // 1. Salva o novo token no store
+      store.set('authToken', newAccessToken);
+      
+      // 2. Notifica o Renderer (App.jsx) para salvar no localStorage
+      if (windowManager) windowManager.sendTokenUpdateToRenderer('system-refresh', newAccessToken);
+
+      // 3. Atualiza o header da requisição original
+      originalRequest.headers['Authorization'] = `Bearer ${newAccessToken}`;
+      
+      // 4. Processa a fila de requisições pendentes com o novo token
+      processQueue(null, newAccessToken);
+
+      // 5. Re-tenta a requisição original
+      return api(originalRequest);
+
+    } catch (refreshError) {
+      console.error("[apiService] Falha CRÍTICA no refresh token:", refreshError.response?.data?.message || refreshError.message);
+      
+      // O refresh token falhou (provavelmente inválido ou expirado)
+      store.delete('authToken');
+      store.delete('refreshToken');
+      
+      // 1. Notifica o Renderer
+      if (windowManager) windowManager.sendForceLogout('Sua sessão expirou. Por favor, faça login novamente.');
+      
+      // 2. Rejeita todas as requisições pendentes
+      processQueue(refreshError, null);
+      
+      // 3. Rejeita a requisição atual
+      return Promise.reject(refreshError);
+    } finally {
+      isRefreshing = false;
+    }
+  }
+);
+
+
+/**
+ * Cria a instância 'authApi' para rotas públicas (login, register, refresh).
+ * Esta instância NÃO usa interceptadores de autenticação para evitar loops.
+ * Ela compartilha as configurações básicas (baseURL, timeout).
+ */
+const authApi = axios.create();
+
+
+/**
+ * Inicializa o apiService com as dependências necessárias do processo principal.
+ * Esta função DEVE ser chamada no 'index.cjs' antes de qualquer outra coisa.
+ *
+ * @param {object} config
+ * @param {Store} config.store - A instância do electron-store
+ * @param {object} config.windowManager - O módulo windowManager
+ * @param {string} config.backendUrl - A URL base do backend
+ */
+function initApiService(config) {
+  store = config.store;
+  windowManager = config.windowManager;
+  BACKEND_BASE_URL = config.backendUrl;
+
+  // Configurações padrão para AMBAS as instâncias
+  const commonConfig = {
+    baseURL: BACKEND_BASE_URL,
+    timeout: 30000,
+  };
+
+  Object.assign(api.defaults, commonConfig);
+  Object.assign(authApi.defaults, commonConfig);
+
+  console.log('[apiService] Inicializado com baseURL:', BACKEND_BASE_URL);
+}
+
+module.exports = {
+  /**
+   * A instância principal para requisições autenticadas.
+   * Automaticamente injeta o 'authToken' e lida com refresh (401).
+   */
+  api,
+  
+  /**
+   * A instância para requisições de autenticação (login, register).
+   * NÃO injeta tokens.
+   */
+  authApi,
+  
+  /**
+   * Função de inicialização para injetar dependências.
+   */
+  initApiService
+};
+
+====================
+ARQUIVO: .\src\main\authentication-worker.cjs
+====================
+// src/main/authentication-worker.cjs
+const { chromium } = require('playwright'); [cite_start]// [cite: 3]
+const fs = require('fs');
+const path = require('path');
+
+let config = null;
+let browser = null;
+let context = null;
+let page = null;
+let isExiting = false;
+
+// ... (Funções auxiliares sendStatus e sendResultAndExit mantidas iguais) ...
+function sendStatus(message) {
+    if (!config?.accountId || !process.connected || isExiting) return;
+    try { process.send({ type: 'status', payload: { message } }); } catch (e) {}
+}
+
+async function sendResultAndExit(payload) {
+    if (isExiting) return;
+    isExiting = true;
+    if (page) try { await page.close(); } catch (e) {}
+    if (context) try { await context.close(); } catch (e) {}
+    if (browser) try { await browser.close(); } catch (e) {}
+    if (process.connected) try { process.send({ type: 'result', payload }); } catch (e) {}
+    process.exit(payload.success ? 0 : 1);
+}
+
+async function runAuthentication(receivedConfig) {
+    config = receivedConfig;
+    const { accountId, loginUrl, gameUrlPattern, proxyConfig } = config;
+
+    if (!accountId || !loginUrl) {
+        await sendResultAndExit({ success: false, error: 'Configuração inválida.' });
+        return;
+    }
+
+    try {
+        sendStatus('Abrindo navegador...');
+        console.log(`[AuthWorker-${accountId}] Tentando lançar navegador (Google Chrome)...`);
+
+        // --- CORREÇÃO AQUI ---
+        browser = await chromium.launch({
+            headless: false,
+            channel: 'chrome', // <--- FORÇA O USO DO CHROME INSTALADO
+            proxy: proxyConfig || undefined
+        });
+        // ---------------------
+
+        browser.on('disconnected', async () => {
+            if (!isExiting) await sendResultAndExit({ success: false, error: 'Navegador fechado.' });
+        });
+
+        context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        });
+        page = await context.newPage();
+
+        await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        sendStatus('Aguardando login manual...');
+
+        // Espera login (timeout 5 min)
+        await page.waitForURL(new RegExp(gameUrlPattern.replace(/\*/g, '.*')), { timeout: 300000 });
+
+        sendStatus('Login detectado! Extraindo dados...');
+        await page.waitForTimeout(1000);
+
+        // Extrai ID da aldeia
+        const villageData = await page.evaluate(() => {
+            return (window.game_data && window.game_data.village) ? { id: window.game_data.village.id } : null;
+        });
+
+        if (!villageData) throw new Error('Falha ao obter ID da aldeia.');
+
+        const cookies = await context.cookies();
+        await sendResultAndExit({ success: true, cookies: cookies, villageId: villageData.id });
+
+    } catch (error) {
+        console.error(`[AuthWorker] Erro: ${error.message}`);
+        
+        let msg = error.message;
+        if (msg.includes('Executable doesn\'t exist') || msg.includes('browserType.launch')) {
+            msg = 'Erro: Google Chrome não encontrado. Por favor, instale o Google Chrome.';
+        } else if (msg.includes('Target closed')) {
+            msg = 'Navegador fechado manualmente.';
+        }
+        
+        await sendResultAndExit({ success: false, error: msg });
+    }
+}
+
+process.on('message', (msg) => {
+    if (msg?.type === 'start' && msg.config) runAuthentication(msg.config);
+});
+
+====================
+ARQUIVO: .\src\main\core_automation-worker.cjs
+====================
+const path = require('path');
+const fs = require('fs');
+const Module = require('module');
+
+const possibleNodeModules = [
+    path.join(__dirname, 'node_modules'),
+    path.join(__dirname, '..', 'node_modules'),
+    path.join(__dirname, '..', '..', 'node_modules'),
+    path.join(process.cwd(), 'node_modules'),
+    path.join(process.resourcesPath || '', 'app', 'node_modules')
+];
+
+possibleNodeModules.forEach(p => {
+    try {
+        if (fs.existsSync(p)) {
+            if (!module.paths.includes(p)) {
+                module.paths.push(p);
+                Module.globalPaths.push(p);
+            }
+        }
+    } catch (e) { }
+});
+
+console.log('[CoreWorker] Processo iniciado.');
+
+try {
+    require('playwright-extra').chromium;
+    require('puppeteer-extra-plugin-stealth')();
+    require('axios');
+    require('cheerio');
+    require('./utils/helpers.cjs');
+    require('./automation_modules/state_extractor.cjs');
+    require('./automation_modules/missions.cjs');
+    require('./automation_modules/rewards.cjs');
+    require('./automation_modules/construction.cjs');
+    require('./automation_modules/recruitment.cjs');
+} catch (error) {
+    console.error('[CoreWorker] FATAL: Falha ao carregar dependências. Erro:', error);
+    if (process.connected) {
+        process.send({
+            type: 'statusUpdate',
+            accountId: 'DESCONHECIDO', 
+            status: 'FALHA!',
+            log: `Erro crítico: ${error.message}`,
+            timestamp: new Date().toISOString()
+        });
+    }
+    process.exit(1); 
+}
+
+const BotWorker = require('./worker_core/BotWorker.cjs');
+let worker = null;
+let startTimeoutId = null;
+
+process.on('message', (message) => {
+    if (!message || !message.type) return;
+    
+    if (startTimeoutId) {
+        clearTimeout(startTimeoutId);
+        startTimeoutId = null;
+    }
+
+    if (message.type === 'start') {
+        if (message.config) {
+            if (!worker) {
+                worker = new BotWorker();
+            }
+            worker.start(message.config).catch(async (error) => {
+                console.error('[CoreWorker] Erro start:', error);
+                if (worker && !worker.isStopping) {
+                    await worker.stop(1);
+                } else {
+                    process.exit(1);
+                }
+            });
+        } else {
+            process.exit(1);
+        }
+    } else if (message.type === 'stop') {
+        if (worker && !worker.isStopping) {
+            worker.stop(0).catch(() => process.exit(0));
+        } else {
+            process.exit(0);
+        }
+    }
+});
+
+process.on('SIGTERM', async () => {
+    if (worker && !worker.isStopping) {
+        await worker.stop(0).catch(() => process.exit(0));
+    } else {
+        process.exit(0);
+    }
+});
+
+process.on('uncaughtException', async (error) => {
+    if (worker && worker.ipcService && !worker.isStopping) {
+        worker.ipcService.sendStatus('FALHA!', `Erro fatal: ${error.message}`);
+    }
+    if (worker && !worker.isStopping) {
+        await worker.stop(1).catch(() => process.exit(1));
+    } else {
+        process.exit(1);
+    }
+});
+
+process.on('unhandledRejection', async (reason) => {
+     if (worker && worker.ipcService && !worker.isStopping) {
+        worker.ipcService.sendStatus('FALHA!', `Erro assíncrono: ${reason.message || reason}`);
+    }
+    if (worker && !worker.isStopping) {
+        await worker.stop(1).catch(() => process.exit(1));
+    } else {
+        process.exit(1);
+    }
+});
+
+startTimeoutId = setTimeout(() => {
+    if (!worker) {
+        process.exit(1);
+    }
+}, 30000);
+
+====================
+ARQUIVO: .\src\main\index.cjs
+====================
+require('bytenode');
+
+if (process.env.IS_WORKER_PROCESS === 'true' && process.env.WORKER_TARGET_PATH) {
+  require(process.env.WORKER_TARGET_PATH);
+  return;
+}
+
+const { app, ipcMain, BrowserWindow } = require('electron');
+const { autoUpdater } = require('electron-updater');
+const path = require('path');
+const fs = require('fs');
+const Store = require('electron-store');
+
+function loadModule(moduleName) {
+  const jscPath = path.join(__dirname, `${moduleName}.jsc`);
+  if (fs.existsSync(jscPath)) {
+    return require(jscPath);
+  }
+  return require(`./${moduleName}.cjs`);
+}
+
+const windowManager = loadModule('windowManager');
+const { api, authApi, initApiService } = loadModule('apiService');
+const workerManager = loadModule('workerManager');
+
+const isDev = process.env.NODE_ENV === 'development';
+const store = new Store({ name: 'twbot-data' });
+
+app.whenReady().then(async () => {
+  windowManager.createWindow();
+
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdatesAndNotify();
+  }
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      windowManager.createWindow();
+    }
+  });
+
+  const WORKERS_PATH = __dirname;
+  const BACKEND_BASE_URL = process.env.BACKEND_URL || 'http://157.173.106.162:5000';
+
+  initApiService({
+    store: store,
+    windowManager: windowManager,
+    backendUrl: BACKEND_BASE_URL
+  });
+
+  workerManager.initWorkerManager({
+    store: store,
+    windowManager: windowManager,
+    api: api,
+    WORKERS_PATH: WORKERS_PATH,
+    isDev: isDev
+  });
+
+  ipcMain.handle('refreshToken', (event, refreshToken) => {
+    return authApi.post('/api/auth/refresh', { refreshToken })
+      .then(response => ({ success: true, ...response.data }))
+      .catch(error => {
+        return { success: false, message: error.response?.data?.message || error.message };
+      });
+  });
+
+  ipcMain.handle('logout', (event, refreshToken) => {
+    return authApi.post('/api/auth/logout', { refreshToken })
+      .then(() => ({ success: true }))
+      .catch(error => {
+        return { success: false };
+      });
+  });
+
+  ipcMain.handle('login', async (event, credentials) => {
+    try {
+      if (!credentials || !credentials.identifier || !credentials.password) {
+        return { success: false, message: 'Credenciais incompletas.' };
+      }
+      const response = await authApi.post('/api/auth/login', credentials);
+      if (response.data?.success && response.data.accessToken && response.data.refreshToken) {
+        store.set('authToken', response.data.accessToken);
+        store.set('refreshToken', response.data.refreshToken);
+        return { success: true, data: response.data };
+      }
+      return { success: false, message: response.data?.message || 'Falha no login (servidor).' };
+    } catch (error) {
+      return { success: false, message: error.response?.data?.message || `Falha comunicação (${error.code || 'N/A'}).` };
+    }
+  });
+
+  ipcMain.handle('register', async (event, userData) => {
+    try {
+      if (!userData || !userData.email || !userData.password) {
+        return { success: false, message: 'Dados incompletos.' };
+      }
+      const response = await authApi.post('/api/auth/register', userData);
+      return response.data;
+    } catch (error) {
+      return { success: false, message: error.response?.data?.message || `Falha comunicação (${error.code || 'N/A'}).` };
+    }
+  });
+
+  const createDirectApiHandler = (ipcName, apiCall) => {
+    ipcMain.handle(ipcName, async (event, ...args) => {
+      try {
+        const response = await apiCall(...args.filter(arg => typeof arg !== 'object' || (arg && typeof arg.sender === 'undefined')));
+        return response.data;
+      } catch (error) {
+        if (error.response?.status === 401) {
+          return { success: false, code: 'UNAUTHORIZED', message: 'Token inválido ou expirado.' };
+        }
+        return { success: false, message: error.response?.data?.message || `Falha (${error.code || 'N/A'}).` };
+      }
+    });
+  };
+
+  ipcMain.handle('fetchDashboardData', async () => {
+    try {
+      const response = await api.get('/api/data/dashboard-data');
+      return { success: true, data: response.data };
+    } catch (error) {
+      if (error.response?.status === 401) {
+        return { success: false, code: 'UNAUTHORIZED', message: 'Token inválido ou expirado.' };
+      }
+      return { success: false, message: error.response?.data?.message || `Falha (${error.code || 'N/A'}).` };
+    }
+  });
+
+  createDirectApiHandler('addTwAccount', (data) => api.post('/api/tw-accounts', data));
+  createDirectApiHandler('deleteTwAccount', ({ accountId }) => api.delete(`/api/tw-accounts/${accountId}`));
+  createDirectApiHandler('update-tw-account', (accountId, data) => api.patch(`/api/tw-accounts/${accountId}`, data));
+  createDirectApiHandler('addProxies', ({ proxies }) => api.post('/api/proxies/add-batch', { proxies }));
+  createDirectApiHandler('deleteProxy', ({ proxyId }) => api.delete(`/api/proxies/delete/${proxyId}`));
+  createDirectApiHandler('fetchConstructionLists', () => api.get('/api/construction-lists'));
+  createDirectApiHandler('createConstructionList', (token, listData) => api.post('/api/construction-lists', listData));
+  createDirectApiHandler('updateConstructionList', (token, listId, listData) => api.put(`/api/construction-lists/${listId}`, listData));
+  createDirectApiHandler('deleteConstructionList', (token, listId) => api.delete(`/api/construction-lists/${listId}`));
+  createDirectApiHandler('fetchRecruitmentTemplates', () => api.get('/api/recruitment-templates'));
+  createDirectApiHandler('createRecruitmentTemplate', (token, templateData) => api.post('/api/recruitment-templates', templateData));
+  createDirectApiHandler('updateRecruitmentTemplate', (token, templateId, templateData) => api.put(`/api/recruitment-templates/${templateId}`, templateData));
+  createDirectApiHandler('deleteRecruitmentTemplate', (token, templateId) => api.delete(`/api/recruitment-templates/${templateId}`));
+  createDirectApiHandler('fetchGroups', () => api.get('/api/groups'));
+  createDirectApiHandler('createGroup', (token, groupData) => api.post('/api/groups', { name: groupData.name }));
+  createDirectApiHandler('updateGroup', (token, groupId, groupData) => api.put(`/api/groups/${groupId}`, groupData));
+  createDirectApiHandler('deleteGroup', (token, groupId) => api.delete(`/api/groups/${groupId}`));
+
+  ipcMain.handle('authenticateAccount', async (event, data) => {
+    return workerManager.startAuthentication(data);
+  });
+
+  ipcMain.handle('start-automation', async (event, data) => {
+    const { account } = data || {};
+    if (!account || !account.id) {
+      return { success: false, message: 'Dados da conta inválidos.' };
+    }
+    return workerManager.startAutomation(account);
+  });
+
+  ipcMain.handle('stop-automation', async (event, accountId) => {
+    return workerManager.stopAutomation(accountId);
+  });
+
+  ipcMain.handle('startVillageViewer', async (event, data) => {
+    return workerManager.startVillageViewer(data);
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    workerManager.shutdownAllWorkers();
+    app.quit();
+  }
+});
+
+====================
+ARQUIVO: .\src\main\updater.cjs
+====================
+// src/main/updater.js (MODIFICADO - Passo 3)
+
+// --- REMOVIDO: axios ---
+const path = require('path');
+const fs = require('fs');
+
+/**
+ * Baixa um arquivo de worker do backend e o salva localmente.
+ *
+ * @param {string} moduleName
+ * @param {string} remoteVersion
+ * @param {object} config - Objeto de configuração
+ * @param {object} config.api - A instância 'api' do apiService
+ * @param {string} config.WORKERS_PATH
+ * @param {object} config.store
+ * @param {string} config.LOCAL_VERSIONS_KEY
+ */
+async function downloadWorker(moduleName, remoteVersion, config) {
+  // --- MODIFICADO: 'api' vem da config, 'token' e 'BACKEND_BASE_URL' removidos ---
+  const { api, WORKERS_PATH, store, LOCAL_VERSIONS_KEY } = config;
+  const workerFileName = `${moduleName}.jsc`;
+  const workerFilePath = path.join(WORKERS_PATH, workerFileName);
+  
+  console.log(`[Updater] Baixando ${moduleName}@${remoteVersion}...`);
+  try {
+    // --- MODIFICADO: Usa 'api' ---
+    const response = await api.get('/api/automation/get-worker', {
+      params: { module: moduleName },
+      responseType: 'arraybuffer'
+      // Headers de 'Authorization' são adicionados pelo interceptor
+    });
+
+    if (!fs.existsSync(WORKERS_PATH)) {
+      fs.mkdirSync(WORKERS_PATH, { recursive: true });
+    }
+    
+    fs.writeFileSync(workerFilePath, response.data);
+    
+    const localVersions = store.get(LOCAL_VERSIONS_KEY, {});
+    localVersions[moduleName] = remoteVersion;
+    store.set(LOCAL_VERSIONS_KEY, localVersions);
+    
+    console.log(`[Updater] ${moduleName} atualizado para ${remoteVersion}`);
+  } catch (error) {
+    // Comentário de Implementação:
+    // O interceptor do 'api' já tratou o 401.
+    // Este 'catch' trata erros específicos de download (Buffer) ou outros (500).
+    if (error.response?.data instanceof Buffer) {
+      try {
+        const errorString = error.response.data.toString('utf-8');
+        const errorJson = JSON.parse(errorString);
+        console.error(`[Updater] Falha download ${moduleName} (Server Error): ${errorJson.message || errorString}`);
+      } catch (parseError) {
+        console.error(`[Updater] Falha download ${moduleName} (Unreadable Error):`, error.response.data);
+      }
+    } else {
+      console.error(`[Updater] Falha download ${moduleName}:`, error.message, error.code);
+    }
+    throw error; // Propaga para 'checkAndUpdateWorkers'
+  }
+}
+
+/**
+ * Verifica no backend por novas versões dos workers.
+ *
+ * @param {object} config - Objeto de configuração
+ * @param {object} config.api - A instância 'api' do apiService
+ * @param {object} config.store
+ * @param {object} config.windowManager
+ * @param {string} config.WORKERS_PATH
+ * @param {string} config.LOCAL_VERSIONS_KEY
+ */
+async function checkAndUpdateWorkers(config) {
+  // --- MODIFICADO: 'api' vem da config, 'token' e 'BACKEND_BASE_URL' removidos ---
+  const { api, store, windowManager, WORKERS_PATH, LOCAL_VERSIONS_KEY } = config;
+  
+  console.log('[Updater] Verificando...');
+  
+  // Comentário de Implementação:
+  // Ainda verificamos o 'authToken' aqui, não para injetá-lo (o 'api' faz
+  // isso), mas para evitar uma chamada de rede desnecessária se
+  // o usuário nem estiver logado.
+  const token = store.get('authToken');
+  if (!token) {
+    console.log('[Updater] Sem token, verificação pulada.');
+    return;
+  }
+  
+  try {
+    // --- MODIFICADO: Usa 'api' ---
+    const response = await api.get('/api/automation/worker-versions');
+    
+    const remoteVersions = response.data;
+    const localVersions = store.get(LOCAL_VERSIONS_KEY, {});
+
+    for (const moduleName in remoteVersions) {
+      const remoteVersion = remoteVersions[moduleName];
+      const localVersion = localVersions[moduleName];
+      const workerFilePath = path.join(WORKERS_PATH, `${moduleName}.jsc`);
+
+      if (!localVersion || localVersion !== remoteVersion || !fs.existsSync(workerFilePath)) {
+        console.log(`[Updater] Atualização necessária para ${moduleName} (Local: ${localVersion}, Remota: ${remoteVersion}, Existe: ${fs.existsSync(workerFilePath)})`);
+        
+        // --- MODIFICADO: 'token' não é mais passado ---
+        await downloadWorker(moduleName, remoteVersion, config);
+      }
+    }
+    console.log('[Updater] Verificação concluída.');
+    
+  } catch (error) {
+    // Comentário de Implementação:
+    // A lógica de 401 foi REMOVIDA daqui.
+    // O interceptor do 'apiService' já tratou o 401, tentou o refresh,
+    // e se falhou, já chamou o 'sendForceLogout' e limpou os tokens.
+    // Este 'catch' agora só precisa lidar com erros de conexão ou de servidor.
+    
+    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+      console.error(`[Updater] Falha conexão (${error.code}). Verifique o servidor e a rede.`);
+    } else if (error.response?.status !== 401) {
+      // Ignora o erro 401 (já tratado), loga os outros
+      console.error('[Updater] Erro ao verificar atualizações (Final):', error.response?.data || error.message);
+    }
+  }
+}
+
+module.exports = {
+  checkAndUpdateWorkers,
+  downloadWorker 
+};
+
+====================
+ARQUIVO: .\src\main\village_viewer_worker.cjs
+====================
+const { chromium } = require('playwright');
+
+let chromiumInstance;
+try {
+    chromiumInstance = chromium;
+    if (!chromiumInstance) {
+        throw new Error('Chromium nulo.');
+    }
+} catch (error) {
+    if (process.connected) {
+        try {
+            process.send({
+                type: 'village-viewer-result',
+                payload: {
+                    success: false,
+                    accountId: 'UKN',
+                    error: `Playwright erro: ${error.message}`,
+                    shouldRestart: false
+                }
+            });
+        } catch (ipcErr) {}
+    }
+    process.exit(1);
+}
+
+let config = null;
+let browser = null;
+let isExiting = false;
+let monitorIntervalId = null;
+
+async function sendResultAndExit(payload) {
+    const accountId = config?.accountId || 'UKN';
+
+    if (isExiting) return;
+    isExiting = true;
+
+    if (monitorIntervalId) {
+        clearInterval(monitorIntervalId);
+        monitorIntervalId = null;
+    }
+
+    if (browser) {
+        try { await browser.close(); } catch (e) {}
+        browser = null;
+    }
+
+    if (process.connected) {
+        try {
+            const finalPayload = {
+                ...payload,
+                accountId: accountId,
+                shouldRestart: payload.shouldRestart !== undefined ? payload.shouldRestart : payload.success
+            };
+            process.send({
+                type: 'village-viewer-result',
+                payload: finalPayload
+            });
+        } catch (ipcError) { }
+    }
+
+    process.exit(payload.success ? 0 : 1);
+}
+
+function startBrowserMonitor() {
+    monitorIntervalId = setInterval(async () => {
+        if (isExiting) {
+            clearInterval(monitorIntervalId);
+            monitorIntervalId = null;
+            return;
+        }
+        if (browser) {
+            try {
+                const isConnected = browser.isConnected();
+                if (!isConnected) {
+                    await sendResultAndExit({ success: true, message: 'Visualizador fechado (monitor).', shouldRestart: true });
+                }
+            } catch (e) {
+                await sendResultAndExit({ success: true, message: `Visualizador fechado (erro monitor: ${e.message}).`, shouldRestart: true });
+            }
+        } else {
+            await sendResultAndExit({ success: true, message: 'Visualizador fechado (navegador nulo).', shouldRestart: true });
+        }
+    }, 3000);
+}
+
+async function runVillageViewer(receivedConfig) {
+    config = receivedConfig;
+    const { accountId, gameUrl, cookies, proxyConfig } = config;
+
+    if (!accountId || !gameUrl || !cookies || cookies.length === 0) {
+        await sendResultAndExit({ success: false, error: 'Configuração inválida.', shouldRestart: false });
+        return;
+    }
+
+    try {
+        browser = await chromiumInstance.launch({
+            headless: false,
+            channel: 'chrome',
+            proxy: proxyConfig || undefined
+        });
+
+        browser.on('disconnected', async () => {
+            if (!isExiting) {
+                await sendResultAndExit({ success: true, message: 'Visualizador fechado (browser desconectado).', shouldRestart: true });
+            }
+        });
+
+        const context = await browser.newContext();
+        await context.addCookies(cookies);
+
+        const page = await context.newPage();
+
+        page.on('close', async () => {
+            if (!isExiting) {
+                await sendResultAndExit({ success: true, message: 'Visualizador fechado pelo usuário.', shouldRestart: true });
+            }
+        });
+
+        await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        const currentUrl = page.url();
+        const isLoggedIn = currentUrl.includes('/game.php');
+
+        if (!isLoggedIn) {
+            throw new Error('Sessão inválida ou expirada.');
+        }
+
+        startBrowserMonitor();
+
+    } catch (error) {
+        let errorMessage = error.message;
+        let shouldRestartOnFail = false;
+
+        if (error.message.includes('Sessão inválida ou expirada')) {
+            errorMessage = error.message;
+            shouldRestartOnFail = false;
+        } else if (error.name === 'TimeoutError') {
+            errorMessage = 'Tempo limite excedido.';
+            shouldRestartOnFail = true;
+        } else if (error.message.includes('browser has been closed') || error.message.includes('Target closed')) {
+            if (!isExiting) {
+                await sendResultAndExit({ success: true, message: 'Visualizador interrompido.', shouldRestart: true });
+            }
+            return;
+        }
+
+        await sendResultAndExit({ success: false, error: errorMessage, shouldRestart: shouldRestartOnFail });
+    }
+}
+
+process.on('message', (message) => {
+    if (isExiting) return;
+
+    if (message?.type === 'start') {
+        if (message.config) {
+            runVillageViewer(message.config).catch(async (err) => {
+                await sendResultAndExit({ success: false, error: `Erro fatal: ${err.message}`, accountId: message.config?.accountId || 'UKN', shouldRestart: false });
+            });
+        } else {
+            sendResultAndExit({ success: false, error: 'Configuração ausente.', shouldRestart: false });
+        }
+    }
+});
+
+process.on('uncaughtException', async (error) => {
+    await sendResultAndExit({ success: false, error: `Erro fatal não capturado: ${error.message}`, accountId: config?.accountId || 'UKN', shouldRestart: false });
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+    await sendResultAndExit({ success: false, error: `Erro assíncrono fatal: ${reason instanceof Error ? reason.message : reason}`, accountId: config?.accountId || 'UKN', shouldRestart: false });
+});
+
+process.on('SIGTERM', async () => {
+    if (!isExiting) {
+        await sendResultAndExit({ success: true, message: 'Worker encerrado por SIGTERM.', shouldRestart: true });
+    }
+});
+
+====================
+ARQUIVO: .\src\main\windowManager.cjs
+====================
+// src/main/windowManager.cjs
+// (v30) - Versão Final Corrigida para Produção/Dev
+
+const { BrowserWindow, screen, app } = require('electron');
+const path = require('path');
+const fs = require('fs');
+
+let mainWindow = null;
+
+/**
+ * Cria a janela principal da aplicação.
+ */
+function createWindow() {
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.workAreaSize;
+  const { x, y } = primaryDisplay.workArea;
+
+  // --- 1. DEFINIÇÃO DO CAMINHO DO PRELOAD ---
+  let preloadPath;
+
+  if (app.isPackaged) {
+    // EM PRODUÇÃO (Arquivo .exe instalado):
+    // A estrutura interna do ASAR geralmente é:
+    // /resources/app.asar/dist/main/windowManager.jsc (onde estamos)
+    // /resources/app.asar/dist/preload/preload.cjs (onde queremos ir)
+    preloadPath = path.join(__dirname, '../preload/preload.cjs');
+  } else {
+    // EM DESENVOLVIMENTO (Rodando npm run dev):
+    // Geralmente src/main/windowManager.cjs
+    // Queremos ir para src/preload/preload.cjs
+    preloadPath = path.join(__dirname, '../preload/preload.cjs');
+  }
+
+  // Verifica se o preload existe (útil para debug)
+  if (!fs.existsSync(preloadPath)) {
+    console.error(`[WindowManager] ERRO CRÍTICO: Preload não encontrado em: ${preloadPath}`);
+  } else {
+    console.log(`[WindowManager] Preload definido para: ${preloadPath}`);
+  }
+
+  // --- 2. CRIAÇÃO DA JANELA ---
+  mainWindow = new BrowserWindow({
+    width: width,
+    height: height,
+    x: x,
+    y: y,
+    show: false, // Só mostra quando estiver pronta para evitar piscar
+    frame: true,
+    maximizable: true,
+    webPreferences: {
+      preload: preloadPath, // Caminho calculado acima
+      nodeIntegration: false, // Segurança: Desabilitado
+      contextIsolation: true, // Segurança: Habilitado
+      sandbox: false // Necessário para alguns requires no preload
+    }
+  });
+
+  // --- 3. CARREGAMENTO DO CONTEÚDO (HTML ou SERVIDOR) ---
+  // Verifica se estamos em DEV (usando variável de ambiente ou argumento)
+  const isDev = !app.isPackaged && (process.env.NODE_ENV === 'development' || process.argv.includes('--dev'));
+
+  if (isDev) {
+    // MODO DEV: Carrega o servidor do Vite
+    console.log('[WindowManager] Modo DEV detectado. Carregando http://localhost:5173');
+    mainWindow.loadURL('http://localhost:5173').catch(e => {
+      console.error('[WindowManager] Erro ao carregar URL de Dev:', e);
+    });
+    // Abre o Inspetor (F12) automaticamente em Dev
+    // mainWindow.webContents.openDevTools(); 
+  } else {
+    // MODO PROD: Carrega o arquivo compilado
+    // Estamos em: .../dist/main/
+    // O HTML está em: .../dist-renderer/index.html
+    const htmlPath = path.join(__dirname, '../../dist-renderer/index.html');
+    
+    console.log(`[WindowManager] Modo PROD. Carregando arquivo: ${htmlPath}`);
+    
+    mainWindow.loadFile(htmlPath).catch(e => {
+      console.error('[WindowManager] Erro ao carregar index.html:', e);
+    });
+  }
+
+  // --- 4. EVENTOS DA JANELA ---
+  
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.maximize();
+    mainWindow.show();
+  });
+
+  mainWindow.webContents.on('crashed', () => {
+    console.error('[WindowManager] O processo da interface (Renderer) travou!');
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+
+  return mainWindow;
+}
+
+/**
+ * Retorna a instância atual da janela.
+ */
+function getMainWindow() {
+  return mainWindow;
+}
+
+/**
+ * Verifica se a janela existe e não foi destruída.
+ */
+function isWindowAvailable() {
+  return mainWindow && mainWindow.webContents && !mainWindow.isDestroyed();
+}
+
+// --- FUNÇÕES DE COMUNICAÇÃO (ENVIAR DADOS PARA O FRONTEND) ---
+
+function sendStatusToRenderer(statusData) {
+  if (isWindowAvailable()) {
+    mainWindow.webContents.send('automation-status-update', statusData);
+  }
+}
+
+function sendProxyStatusToRenderer(statusData) {
+  if (isWindowAvailable()) {
+    mainWindow.webContents.send('automation-proxy-status-update', statusData);
+  }
+}
+
+function sendDashboardUpdateToRenderer(dashboardData) {
+  if (isWindowAvailable()) {
+    mainWindow.webContents.send('dashboard-update', dashboardData);
+  }
+}
+
+function sendAuthStatusToRenderer(accountId, message) {
+  if (isWindowAvailable()) {
+    mainWindow.webContents.send('automation-status-update', {
+      type: 'statusUpdate',
+      accountId: accountId,
+      status: 'AUTENTICANDO',
+      log: message,
+      timestamp: new Date().toISOString()
+    });
+  }
+}
+
+function sendTokenUpdateToRenderer(accountId, newAccessToken) {
+  if (isWindowAvailable()) {
+    mainWindow.webContents.send('token:updated', {
+      accountId: accountId,
+      newAccessToken: newAccessToken
+    });
+  }
+}
+
+function sendForceLogout(message) {
+  if (isWindowAvailable()) {
+    mainWindow.webContents.send('force-logout', message);
+  }
+}
+
+// Exporta tudo para ser usado no index.cjs e workerManager.cjs
+module.exports = {
+  createWindow,
+  getMainWindow,
+  sendStatusToRenderer,
+  sendProxyStatusToRenderer,
+  sendDashboardUpdateToRenderer,
+  sendAuthStatusToRenderer,
+  sendTokenUpdateToRenderer,
+  sendForceLogout
+};
+
+====================
+ARQUIVO: .\src\main\workerManager.cjs
+====================
+const { app } = require('electron');
+const { fork } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const activeWorkers = new Map();
+const activeAuthWorkers = new Map();
+const activeViewWorkers = new Map();
+const preViewStatus = new Map();
+const workerLastStatus = new Map();
+
+let store;
+let windowManager;
+let api;
+let WORKERS_PATH;
+let isDev;
+
+function initWorkerManager(config) {
+  store = config.store;
+  windowManager = config.windowManager;
+  api = config.api;
+  WORKERS_PATH = config.WORKERS_PATH;
+  isDev = config.isDev;
+}
+
+function spawnWorkerProcess(workerFileName, args = [], options = {}) {
+  let workerPath;
+  if (isDev) {
+    workerPath = path.join(__dirname, workerFileName);
+  } else {
+    const jscName = workerFileName.replace('.cjs', '.jsc');
+    workerPath = path.join(__dirname, jscName);
+  }
+
+  if (!fs.existsSync(workerPath)) {
+    throw new Error(`Arquivo worker não encontrado: ${workerPath}`);
+  }
+
+  const entryPoint = path.join(__dirname, 'index.cjs');
+  
+  let nodeModulesPath = path.join(app.getAppPath(), 'node_modules');
+  if (!fs.existsSync(nodeModulesPath)) {
+      const alternativePath = path.join(__dirname, '..', '..', 'node_modules');
+      if (fs.existsSync(alternativePath)) {
+          nodeModulesPath = alternativePath;
+      }
+  }
+
+  const env = {
+    ...process.env,
+    ...options.env,
+    IS_WORKER_PROCESS: 'true',
+    WORKER_TARGET_PATH: workerPath,
+    NODE_PATH: nodeModulesPath, 
+    ELECTRON_RUN_AS_NODE: '1'
+  };
+
+  return fork(entryPoint, args, {
+    ...options,
+    env: env,
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+  });
+}
+
+async function getProxyConfigFromServer(proxyId) {
+  if (!proxyId) return null;
+  try {
+    const response = await api.get(`/api/proxies/details/${proxyId}`);
+    if (response.data?.success) {
+      const { host, port, username, password } = response.data.data;
+      const proxyConfig = { server: `${host}:${port}` };
+      if (username) proxyConfig.username = username;
+      if (password) proxyConfig.password = password;
+      return proxyConfig;
+    }
+    throw new Error(response.data.message || 'Proxy não encontrado.');
+  } catch (error) {
+    throw new Error(`Falha buscar proxy: ${error.message}`);
+  }
+}
+
+async function startAutomation(account) {
+  if (!account || !account.id) return { success: false, message: 'Dados da conta inválidos.' };
+  const accountId = account.id;
+
+  if (activeWorkers.has(accountId)) {
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'EM_EXECUÇÃO', log: 'Já rodando.' });
+    return { success: true, code: 'ALREADY_RUNNING', message: 'Bot já rodando.' };
+  }
+
+  workerLastStatus.delete(accountId);
+
+  const authToken = store.get('authToken');
+  const refreshToken = store.get('refreshToken');
+  if (!authToken || !refreshToken) {
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'SESSÃO_AUSENTE', log: 'Faça login na aplicação.' });
+    return { success: false, code: 'AUTH_MISSING', message: 'Tokens ausentes.' };
+  }
+
+  const sessionKey = `session-account-${accountId}`;
+  const sessionDataCookies = store.get(sessionKey);
+  if (!sessionDataCookies) {
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'SESSÃO_AUSENTE', log: 'Autentique.' });
+    return { success: false, code: 'SESSION_MISSING', message: 'Sessão não encontrada.' };
+  }
+
+  let proxyConfig = null;
+  if (account.proxy_id) {
+    try { proxyConfig = await getProxyConfigFromServer(account.proxy_id);
+    } 
+    catch (proxyError) { return { success: false, message: proxyError.message };
+    }
+  }
+
+  const sessionForWorker = { cookies: sessionDataCookies, proxy: proxyConfig };
+  try {
+    const child = spawnWorkerProcess('core_automation-worker.cjs');
+    activeWorkers.set(accountId, child);
+    child.stderr.on('data', d => windowManager.sendStatusToRenderer({ accountId, status: 'FALHA!', log: `STDERR: ${d}` }));
+    child.on('message', (msg) => {
+      if (!msg || !msg.type) return;
+
+      if (msg.type === 'statusUpdate') {
+        windowManager.sendStatusToRenderer(msg);
+        if (msg.status === 'CAPTCHA_DETECTADO' || msg.status === 'FALHA!') {
+          workerLastStatus.set(accountId, { status: msg.status, log: msg.log });
+        }
+      } else if (msg.type === 'proxyStatusUpdate') {
+        windowManager.sendProxyStatusToRenderer({ accountId: msg.accountId, proxyStatus: msg.proxyStatus });
+      } else if (msg.type === 'dashboard-update') {
+        windowManager.sendDashboardUpdateToRenderer(msg);
+      } else if (msg.type === 'sessionUpdate') {
+        if (msg.payload && msg.payload.cookies && msg.accountId) {
+          try { store.set(`session-account-${msg.accountId}`, msg.payload.cookies); } catch (e) { console.error(e); }
+        }
+      } else if (msg.type === 'tokenUpdate') {
+        try { store.set('authToken', msg.payload.newAccessToken); } catch (e) { console.error(e);
+        }
+        windowManager.sendTokenUpdateToRenderer(msg.accountId, msg.payload.newAccessToken);
+      }
+    });
+    child.stdout.on('data', (d) => {
+      const log = d.toString().trim();
+      if (log.includes('CAPTCHA DETECTADO')) {
+        workerLastStatus.set(accountId, { status: 'CAPTCHA_DETECTADO', log: log });
+        windowManager.sendStatusToRenderer({ accountId: accountId, status: 'CAPTCHA_DETECTADO', log: log });
+      }
+    });
+    child.on('error', (err) => {
+      windowManager.sendStatusToRenderer({ accountId: accountId, status: 'FALHA!', log: `Erro Proc: ${err.message}` });
+      activeWorkers.delete(accountId);
+      workerLastStatus.delete(accountId);
+    });
+    child.on('exit', (code) => {
+      if (activeWorkers.has(accountId)) {
+        const lastStatusData = workerLastStatus.get(accountId);
+        let finalStatus = code === 0 ? 'PARADO' : 'FALHA!';
+        let logMsg = code === 0 ? 'Encerrado.' : `Encerrado erro (${code}).`;
+
+        if (lastStatusData?.status === 'CAPTCHA_DETECTADO') {
+          finalStatus = 'CAPTCHA_DETECTADO';
+          logMsg = lastStatusData.log || 'Captcha detectado.';
+        } else if (lastStatusData?.status === 'FALHA!') {
+          finalStatus = 'FALHA!';
+          logMsg = lastStatusData.log || `Falha (${code}).`;
+        }
+
+        windowManager.sendStatusToRenderer({ accountId: accountId, status: finalStatus, log: logMsg });
+        activeWorkers.delete(accountId);
+      }
+      workerLastStatus.delete(accountId);
+    });
+    child.send({
+      type: 'start',
+      config: {
+        accountId: accountId,
+        session: sessionForWorker,
+        region: account.region,
+        tw_world: account.tw_world,
+        villageId: account.villageid,
+        authToken: authToken,
+        refreshToken: refreshToken
+      }
+    });
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'INICIANDO...', log: 'Inicializando...' });
+    return { success: true, message: 'Worker iniciado.' };
+  } catch (execError) {
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'FALHA!', log: `Erro fork: ${execError.message}` });
+    return { success: false, message: `Falha iniciar worker: ${execError.message}` };
+  }
+}
+
+async function stopAutomation(accountId) {
+  const workerProcess = activeWorkers.get(accountId);
+  if (workerProcess) {
+    try { workerProcess.send({ type: 'stop' }); } catch (e) { try { workerProcess.kill('SIGTERM');
+    } catch (err) { } }
+    workerLastStatus.delete(accountId);
+    return { success: true, message: 'Stop enviado.' };
+  } else {
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'PARADO', log: 'Já estava parado.' });
+    return { success: false, code: 'NOT_RUNNING', message: 'Não ativo.' };
+  }
+}
+
+async function startAuthentication(data) {
+  const { accountId, region, proxyId } = data || {};
+  if (!accountId) return { success: false, message: 'ID obrigatório.' };
+  if (activeAuthWorkers.has(accountId)) {
+    windowManager.sendAuthStatusToRenderer(accountId, 'Autenticação já em andamento.');
+    return { success: false, message: 'Já em andamento.' };
+  }
+
+  return new Promise(async (resolve, reject) => {
+    let proxyConfig = null;
+    const loginUrl = region === 'br' ? 'https://www.tribalwars.com.br/' : 'https://www.tribalwars.com.pt/';
+    const gameUrlPattern = `https://${region}*.tribalwars.*${region}/game.php*`;
+    let authWorker;
+    let timeoutId;
+
+    try {
+        if (proxyId) proxyConfig = await getProxyConfigFromServer(proxyId);
+
+        authWorker = spawnWorkerProcess('authentication-worker.cjs');
+        activeAuthWorkers.set(accountId, authWorker);
+
+        authWorker.stdout.on('data', (data) => { });
+        authWorker.stderr.on('data', (data) => { });
+
+        timeoutId = setTimeout(() => {
+          if (authWorker && activeAuthWorkers.has(accountId)) {
+            activeAuthWorkers.delete(accountId);
+            try { authWorker.kill('SIGTERM'); } catch (e) { }
+            reject(new Error('Timeout na autenticação.'));
+          }
+        }, 300000);
+
+        authWorker.on('message', async (message) => {
+          if (!message || !message.type) return;
+
+          if (message.type === 'status') {
+            windowManager.sendAuthStatusToRenderer(accountId, message.payload?.message || 'Status...');
+          } else if (message.type === 'result') {
+            clearTimeout(timeoutId);
+            const workerProcess = activeAuthWorkers.get(accountId);
+            activeAuthWorkers.delete(accountId);
+
+            if (message.payload?.success) {
+              store.set(`session-account-${accountId}`, message.payload.cookies);
+              try {
+                if (message.payload.villageId) {
+                  await api.patch(`/api/tw-accounts/${accountId}`, { villageId: String(message.payload.villageId) });
+                }
+              } catch (apiError) { console.error(apiError);
+              }
+
+              resolve({ success: true, message: 'Autenticado com sucesso.' });
+            } else {
+              reject(new Error(message.payload?.error || 'Erro desconhecido.'));
+            }
+            if (workerProcess) workerProcess.kill();
+          }
+        });
+
+        authWorker.on('error', (err) => {
+          clearTimeout(timeoutId);
+          windowManager.sendAuthStatusToRenderer(accountId, `Erro crítico: ${err.message}`);
+          activeAuthWorkers.delete(accountId);
+          reject(new Error(err.message));
+        });
+        authWorker.on('exit', (code) => {
+          clearTimeout(timeoutId);
+          if (activeAuthWorkers.has(accountId)) {
+            windowManager.sendAuthStatusToRenderer(accountId, `Worker falhou (${code})`);
+            activeAuthWorkers.delete(accountId);
+            reject(new Error(`Worker falhou (${code})`));
+          }
+        });
+        authWorker.send({ type: 'start', config: { accountId, loginUrl, gameUrlPattern, proxyConfig } });
+        windowManager.sendAuthStatusToRenderer(accountId, 'Abrindo navegador...');
+    } catch (error) {
+      if (authWorker) authWorker.kill();
+      reject(error);
+    }
+  });
+}
+
+async function startVillageViewer(data) {
+  const { account } = data || {};
+  if (!account || !account.id) return { success: false, message: 'Conta inválida.' };
+  const accountId = account.id;
+  if (activeViewWorkers.has(accountId)) return { success: false, message: 'Já aberto.' };
+
+  const automationWorker = activeWorkers.get(accountId);
+  if (automationWorker) {
+    preViewStatus.set(accountId, 'ON');
+    automationWorker.kill();
+    activeWorkers.delete(accountId);
+  } else {
+    preViewStatus.set(accountId, 'OFF');
+  }
+
+  windowManager.sendStatusToRenderer({ accountId: accountId, status: 'VISUALIZANDO', log: 'Abrindo...' });
+  let child;
+  try {
+    const sessionDataCookies = store.get(`session-account-${accountId}`);
+    if (!sessionDataCookies) {
+      windowManager.sendStatusToRenderer({ accountId: accountId, status: 'SESSÃO_AUSENTE', log: 'Autentique.' });
+      return { success: false, code: 'SESSION_MISSING', message: 'Sessão não encontrada.' };
+    }
+
+    let proxyConfig = null;
+    if (account.proxy_id) proxyConfig = await getProxyConfigFromServer(account.proxy_id);
+
+    const domain = account.region === 'br' ? 'com.br' : 'com.pt';
+    const gameUrl = `https://${account.region}${account.tw_world}.tribalwars.${domain}/game.php?screen=overview`;
+    child = spawnWorkerProcess('village_viewer_worker.cjs');
+    activeViewWorkers.set(accountId, child);
+
+    child.on('message', async (msg) => {
+      if (msg.type === 'village-viewer-result') {
+        const originalStatus = preViewStatus.get(accountId);
+        if (msg.payload.shouldRestart && originalStatus === 'ON') {
+          startAutomation(account);
+        } else if (msg.payload.success) {
+          windowManager.sendStatusToRenderer({ accountId: accountId, status: 'PARADO', log: 'Fim visualização.' });
+        }
+        
+        activeViewWorkers.delete(accountId);
+      } else if (msg.type === 'statusUpdate') {
+        windowManager.sendStatusToRenderer(msg);
+      }
+    });
+    child.on('exit', async (code) => {
+      if (activeViewWorkers.has(accountId)) {
+        const originalStatus = preViewStatus.get(accountId);
+        if (code === 0 && originalStatus === 'ON') {
+          startAutomation(account);
+        } else if (code === 0 && originalStatus === 'OFF') {
+          windowManager.sendStatusToRenderer({ accountId: accountId, status: 'PARADO', log: 'Fim visualização.' });
+        } else {
+          windowManager.sendStatusToRenderer({ accountId: accountId, status: 'FALHA!', log: `View caiu (${code}).` });
+        }
+        activeViewWorkers.delete(accountId);
+      }
+    });
+    child.send({ type: 'start', config: { accountId, gameUrl, cookies: sessionDataCookies, proxyConfig } });
+    return { success: true, message: 'Visualizador aberto.' };
+  } catch (error) {
+    if (child) child.kill();
+    windowManager.sendStatusToRenderer({ accountId: accountId, status: 'FALHA!', log: `Erro: ${error.message}` });
+    const originalStatus = preViewStatus.get(accountId);
+    if (originalStatus === 'ON') startAutomation(account).catch(e => console.error(e));
+    return { success: false, message: error.message };
+  }
+}
+
+function shutdownAllWorkers() {
+  const allMaps = [activeWorkers, activeAuthWorkers, activeViewWorkers];
+  allMaps.forEach(map => {
+    map.forEach(worker => {
+      if (worker && !worker.killed) worker.kill('SIGTERM');
+    });
+    map.clear();
+  });
+}
+
+module.exports = {
+  initWorkerManager,
+  startAutomation,
+  stopAutomation,
+  startAuthentication,
+  startVillageViewer,
+  shutdownAllWorkers
+};
+
+====================
+ARQUIVO: .\src\main\automation_modules\construction.cjs
+====================
+// src/main/automation_modules/construction.cjs (CORRIGIDO PARA BYTENODE)
+console.log('[Construction] Módulo carregado.');
+
+const BUILDING_ID_MAP = {
+    "timber": "wood", 
+    "clay": "stone",
+    "iron": "iron"
+};
+
+function translateBuildingId(inputId) {
+    return BUILDING_ID_MAP[inputId] || inputId;
+}
+
+function checkResources(currentRes, cost) {
+    return currentRes.wood >= (cost.wood || 0) && 
+           currentRes.clay >= (cost.stone || 0) && 
+           currentRes.iron >= (cost.iron || 0);
+}
+
+async function execute(page, sendStatus, config, gameState, apiService) {
+    const accountId = config.accountId;
+    const villageId = config.villageId;
+    const csrfToken = gameState.csrfToken; 
+
+    if (!csrfToken) return null;
+
+    if (!gameState.buildingsData || !gameState.population || !gameState.resources) return null;
+
+    const queue = gameState.constructionQueue || [];
+    const MAX_QUEUE = 2; 
+    if (queue.length >= MAX_QUEUE) return null;
+
+    let nextItem = null;
+    const currentRes = gameState.resources;
+    const currentBuildings = gameState.buildings;
+    const pop = gameState.population;
+    
+    // --- Lógica de Prioridade (Fazenda/Armazém) ---
+    const popUsage = pop.current / pop.max;
+    if (config.auto_farm_enabled && popUsage >= 0.80) {
+        const farmCost = gameState.buildingsData.farm;
+        if (farmCost && checkResources(currentRes, farmCost)) {
+            const currentLevel = parseInt(currentBuildings.farm || "0", 10);
+            nextItem = { id: 'farm', level: currentLevel + 1 };
+        }
+    }
+
+    if (!nextItem && config.auto_warehouse_enabled && config.constructionListId) {
+        const nextListItem = await getNextItemFromList(accountId, config.constructionListId, currentBuildings, queue, apiService);
+        if (nextListItem) {
+            const itemCost = gameState.buildingsData[nextListItem.id];
+            if (itemCost) {
+                const maxStorage = currentRes.storage.max;
+                if (itemCost.wood > maxStorage || itemCost.stone > maxStorage || itemCost.iron > maxStorage) {
+                    const storageCost = gameState.buildingsData.storage;
+                    if (storageCost && checkResources(currentRes, storageCost)) {
+                        const currentLevel = parseInt(currentBuildings.storage || "0", 10);
+                        nextItem = { id: 'storage', level: currentLevel + 1 };
+                    }
+                }
+            }
+        }
+    }
+
+    if (!nextItem && config.constructionListId) {
+        nextItem = await getNextItemFromList(accountId, config.constructionListId, currentBuildings, queue, apiService);
+    }
+
+    if (!nextItem) return null;
+    
+    const buildingId = nextItem.id;
+    const buildingData = gameState.buildingsData ? gameState.buildingsData[buildingId] : null;
+
+    if (buildingData && !checkResources(currentRes, buildingData)) {
+        return null; 
+    }
+    
+    // --- EXECUÇÃO FETCH ---
+    try {
+        const buildUrl = `/game.php?village=${villageId}&screen=main&ajaxaction=upgrade_building&type=main`;
+        const refererUrl = page.url(); 
+        const payload = {
+            id: nextItem.id,
+            force: "1",
+            destroy: "0",
+            source: villageId,
+            h: csrfToken
+        };
+        const bodyPayload = new URLSearchParams(payload).toString();
+
+        // **CORREÇÃO CRÍTICA PARA BYTENODE**: Passando a função como string
+        const result = await page.evaluate(`
+            async ({ url, bodyString, referer }) => {
+                try {
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 
+                            'Accept': 'application/json, text/javascript, */*',
+                            'TribalWars-Ajax': '1',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'Referer': referer
+                        },
+                        body: bodyString 
+                    });
+                    
+                    if (!response.ok) {
+                        return { error: 'Network error: ' + response.statusText };
+                    }
+                    return await response.json();
+                } catch (e) {
+                   return { error: 'Falha ao parsear resposta: ' + e.message };
+                }
+            }
+        `, { url: buildUrl, bodyString: bodyPayload, referer: refererUrl });
+
+        if (result?.response?.success && result?.game_data?.village) { 
+            return result.game_data.village; 
+        } else if (result?.response?.success) {
+            return null;
+        } else {
+            console.warn(`[Construction-${accountId}] Falha:`, JSON.stringify(result));
+            return null;
+        }
+
+    } catch (error) {
+        console.error(`[Construction-${accountId}] Erro fatal: ${error.message}`);
+    }
+    return null;
+}
+
+async function getNextItemFromList(accountId, listId, currentBuildings, queue, apiService) {
+    let constructionList;
+    try {
+        const response = await apiService.get(`/api/construction-lists/${listId}`);
+        if (!response.data?.success || !response.data.list) throw new Error('Lista inválida.');
+        constructionList = response.data.list;
+        if (!constructionList.steps) return null;
+    } catch (error) {
+        return null;
+    }
+
+    for (const item of constructionList.steps) {
+        const building = translateBuildingId(item.buildingId);
+        const targetLevel = parseInt(item.level, 10);
+        const currentLevel = parseInt(currentBuildings[building] || "0", 10);
+        if (currentLevel < targetLevel) {
+            const inQueue = queue.some(q => q.buildingId === building && q.level === (currentLevel + 1));
+            if (inQueue) continue;
+            return { id: building, level: currentLevel + 1 };
+        }
+    }
+    return null;
+}
+
+module.exports = { execute };
+
+====================
+ARQUIVO: .\src\main\automation_modules\missions.cjs
+====================
+// src/main/automation_modules/missions.cjs (CORRIGIDO PARA BYTENODE)
+const { randomWait } = require('../utils/helpers.cjs');
+
+async function execute(page, sendStatus, config, gameState) {
+    const accountId = config.accountId;
+    const villageId = config.villageId;
+    const csrfToken = gameState.csrfToken;
+
+    if (!csrfToken) return;
+
+    const missionsToCollect = gameState.completedMissions || [];
+    if (missionsToCollect.length === 0) return;
+
+    sendStatus('EM_EXECUÇÃO', `Coletando missões...`);
+    const refererUrl = page.url();
+    let coletadas = 0;
+
+    try {
+        for (const mission of missionsToCollect) {
+            if (!process.connected) return;
+            const questId = mission.reward_id;
+            const collectUrl = `/game.php?village=${villageId}&screen=api&ajaxaction=quest_complete&quest=${questId}&skip=false`;
+            const payload = { h: csrfToken };
+            const bodyPayload = new URLSearchParams(payload).toString();
+
+            // **CORREÇÃO**: Stringified function
+            const result = await page.evaluate(`
+                async ({ url, bodyString, referer }) => {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                'Accept': 'application/json, text/javascript, */*',
+                                'TribalWars-Ajax': '1',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Referer': referer
+                            },
+                            body: bodyString
+                        });
+                        if (!response.ok) return { error: 'Network error: ' + response.statusText };
+                        return await response.json();
+                    } catch (e) {
+                        return { error: 'Fetch error: ' + e.message };
+                    }
+                }
+            `, { url: collectUrl, bodyString: bodyPayload, referer: refererUrl });
+
+            if (result.response && !result.error) {
+                coletadas++;
+            } else {
+                if (result.error || result.response === false) {
+                    sendStatus('EM_EXECUÇÃO', `Falha ao coletar missão.`);
+                }
+            }
+            await randomWait(2500, 4500);
+        }
+    } catch (error) {
+        console.error(`[Missions-${accountId}] Erro:`, error);
+    }
+}
+
+module.exports = { execute };
+
+====================
+ARQUIVO: .\src\main\automation_modules\recruitment.cjs
+====================
+// src/main/automation_modules/recruitment.cjs (CORRIGIDO PARA BYTENODE)
+console.log('[Recruitment] Módulo carregado.');
+const { randomWait } = require('../utils/helpers.cjs');
+const cheerio = require('cheerio');
+
+const RESOURCE_BUFFER_PERCENTAGE = 0.40;
+const RECRUITABLE_UNITS = [
+    'spear', 'sword', 'axe', 'archer', 'spy', 'light', 'marcher', 'heavy', 'ram', 'catapult', 'knight'
+];
+const UNIT_BUILDING_MAP = {
+    spear: 'barracks', sword: 'barracks', axe: 'barracks', archer: 'barracks',
+    spy: 'stable', light: 'stable', marcher: 'stable', heavy: 'stable', knight: 'stable',
+    ram: 'garage', catapult: 'garage'
+};
+const MAX_QUEUE_PER_BUILDING = 2;
+
+const UNIT_COSTS = {
+    spear:    { wood: 50,  stone: 30,  iron: 10,  pop: 1 },
+    sword:    { wood: 30,  stone: 30,  iron: 70,  pop: 1 },
+    axe:      { wood: 60,  stone: 30,  iron: 40,  pop: 1 },
+    spy:      { wood: 50,  stone: 50,  iron: 20,  pop: 2 },
+    light:    { wood: 125, stone: 100, iron: 250, pop: 4 },
+    heavy:    { wood: 200, stone: 150, iron: 600, pop: 6 },
+    ram:      { wood: 300, stone: 200, iron: 200, pop: 5 },
+    catapult: { wood: 320, stone: 400, iron: 100, pop: 8 },
+    archer:   { wood: 0, stone: 0, iron: 0, pop: 0 },
+    marcher:  { wood: 0, stone: 0, iron: 0, pop: 0 },
+    knight:   { wood: 0, stone: 0, iron: 0, pop: 0 }
+};
+
+function parseRecruitmentQueue(htmlContent) {
+    const $ = cheerio.load(htmlContent);
+    const queueUnits = {};
+    const queueLengths = { barracks: 0, stable: 0, garage: 0 };
+    
+    const queueIdsMap = {
+        'trainqueue_barracks': 'barracks',
+        'trainqueue_stable': 'stable',
+        'trainqueue_garage': 'garage'
+    };
+
+    for (const [queueId, buildingName] of Object.entries(queueIdsMap)) {
+        const rows = $(`tbody#${queueId} tr[id^="trainorder_"]`);
+        queueLengths[buildingName] = rows.length;
+
+        rows.each((i, row) => {
+             try {
+                 const unitElement = $(row).find('div.unit_sprite');
+                 if (unitElement.length === 0) return;
+                 const unitId = unitElement.attr('class').split(' ').pop();
+                 if (!RECRUITABLE_UNITS.includes(unitId)) return;
+                 const text = $(row).find('td').first().text().trim();
+                 const amountMatch = text.match(/^(\d+)/);
+                 if (unitId && amountMatch) {
+                     queueUnits[unitId] = (queueUnits[unitId] || 0) + parseInt(amountMatch[1], 10);
+                 }
+            } catch (e) {}
+        });
+        
+        const wrapperSelector = `div#${queueId.replace('trainqueue_', 'trainqueue_wrap_')}`;
+        const inProductionRow = $(`${wrapperSelector} tr.lit`);
+        if (inProductionRow.length > 0) {
+            try {
+                const unitElement = inProductionRow.find('div.unit_sprite');
+                const unitId = unitElement.length > 0 ? unitElement.attr('class').split(' ').pop() : null;
+                const text = inProductionRow.find('td').first().text().trim();
+                const amountMatch = text.match(/^(\d+)/);
+                if (unitId && amountMatch && RECRUITABLE_UNITS.includes(unitId)) {
+                    queueUnits[unitId] = (queueUnits[unitId] || 0) + parseInt(amountMatch[1], 10);
+                }
+            } catch (e) {}
+        }
+    }
+    return { units: queueUnits, lengths: queueLengths };
+}
+
+function calculateScavengingTroops(scavengeOptions) {
+    const scavengingTroops = {};
+    if (!scavengeOptions || typeof scavengeOptions !== 'object') return scavengingTroops;
+
+    for (const optionId in scavengeOptions) {
+        const option = scavengeOptions[optionId];
+        if (option.scavenging_squad && option.scavenging_squad.unit_counts) {
+            const units = option.scavenging_squad.unit_counts;
+            for (const unitId in units) {
+                if (units.hasOwnProperty(unitId) && RECRUITABLE_UNITS.includes(unitId)) {
+                    scavengingTroops[unitId] = (scavengingTroops[unitId] || 0) + units[unitId];
+                }
+            }
+        }
+    }
+    return scavengingTroops;
+}
+
+function calculateProportionalBatch(deficit, resources, unitCosts) {
+    let totalCost = { wood: 0, clay: 0, iron: 0, pop: 0 };
+    for (const unitId in deficit) {
+         const amount = deficit[unitId];
+         const cost = unitCosts[unitId];
+         if (cost) {
+             totalCost.wood += cost.wood * amount;
+             totalCost.clay += cost.stone * amount; 
+             totalCost.iron += cost.iron * amount;
+             totalCost.pop += cost.pop * amount;
+         }
+    }
+    if (totalCost.wood === 0 && totalCost.clay === 0 && totalCost.iron === 0) return {};
+
+    let bottleneck = 1.0; 
+    if (totalCost.wood > 0) bottleneck = Math.min(bottleneck, resources.wood / totalCost.wood);
+    if (totalCost.clay > 0) bottleneck = Math.min(bottleneck, resources.clay / totalCost.clay);
+    if (totalCost.iron > 0) bottleneck = Math.min(bottleneck, resources.iron / totalCost.iron);
+    if (totalCost.pop > 0)  bottleneck = Math.min(bottleneck, resources.pop / totalCost.pop);
+    if (bottleneck <= 0) return {};
+
+    const batch = {};
+    for (const unitId in deficit) {
+         const amountToRecruit = Math.floor(deficit[unitId] * bottleneck);
+         if (amountToRecruit > 0) batch[unitId] = amountToRecruit;
+    }
+    return batch;
+}
+
+async function execute(page, sendStatus, config, gameState) {
+    const accountId = config.accountId;
+    const villageId = config.villageId;
+    const csrfToken = gameState.csrfToken; 
+    
+    const targetTemplate = config.recruitmentTemplate;
+    if (!targetTemplate || Object.keys(targetTemplate).length === 0) return null;
+    
+    if (!gameState.village || !gameState.resources || !gameState.population) return null;
+    
+    const unitCosts = UNIT_COSTS;
+    if (!gameState.scavengeInfo || !gameState.scavengeInfo.unit_counts_home) return null;
+    const troopsHome = gameState.scavengeInfo.unit_counts_home;
+    const troopsScavenging = calculateScavengingTroops(gameState.scavengeInfo.options);
+
+    sendStatus('EM_EXECUÇÃO', 'Verificando fila de recrutamento...');
+    const getRefererUrl = page.url(); 
+    const url = `/game.php?village=${villageId}&screen=train`; 
+
+    // **CORREÇÃO 1 (GET): Stringified function**
+    const htmlContent = await page.evaluate(`
+        async ({ url, referer }) => {
+             try {
+                 const res = await fetch(url, {
+                     method: 'GET',
+                     headers: {
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'TribalWars-Ajax': '1',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': referer 
+                     }
+                 });
+                 if (!res.ok) return { error: 'Network error: ' + res.statusText };
+                 
+                 const contentType = res.headers.get("content-type");
+                 if (contentType && contentType.includes("application/json")) {
+                     const jsonData = await res.json();
+                     return jsonData.content; 
+                 } else {
+                     return await res.text(); 
+                 }
+             } catch (e) {
+                 return { error: 'Fetch error: ' + e.message };
+             }
+        }
+    `, { url: url, referer: getRefererUrl });
+
+    if (typeof htmlContent !== 'string' || (htmlContent && htmlContent.error)) {
+         throw new Error(htmlContent.error || 'Erro na tela de recrutamento.');
+    }
+    
+    const { units: queuedTroops, lengths: queueLengths } = parseRecruitmentQueue(htmlContent);
+    
+    try {
+         const deficit = {};
+         let needsRecruiting = false;
+         
+         for (const unitId of RECRUITABLE_UNITS) {
+             const target = targetTemplate[unitId] || 0;
+             if (target === 0) continue; 
+             
+             const home = troopsHome[unitId] || 0;
+             const scavenging = troopsScavenging[unitId] || 0;
+             const queued = queuedTroops[unitId] || 0;
+             const totalEffective = home + scavenging + queued;
+             const diff = target - totalEffective;
+
+             if (diff > 0 && unitCosts[unitId] && unitCosts[unitId].pop > 0) { 
+                 const building = UNIT_BUILDING_MAP[unitId];
+                 if (building && queueLengths[building] >= MAX_QUEUE_PER_BUILDING) continue; 
+                 deficit[unitId] = diff;
+                 needsRecruiting = true;
+             }
+         }
+         
+         if (!needsRecruiting) return null;
+         
+         const r = gameState.resources;
+         const p = gameState.population; 
+         
+         const maxStorage = r.storage.max;
+         const buffer = maxStorage * RESOURCE_BUFFER_PERCENTAGE;
+         const spendableResources = {
+             wood: Math.max(0, r.wood - buffer),
+             clay: Math.max(0, r.clay - buffer), 
+             iron: Math.max(0, r.iron - buffer),
+             pop: Math.max(0, p.max - p.current) 
+         };
+
+         const batchToRecruit = calculateProportionalBatch(deficit, spendableResources, unitCosts);
+         if (Object.keys(batchToRecruit).length === 0) return null;
+         
+         const payload = {};
+         for (const unitId in batchToRecruit) {
+             payload[`units[${unitId}]`] = batchToRecruit[unitId];
+         }
+         payload['h'] = csrfToken;
+         
+         const recruitUrl = `/game.php?village=${villageId}&screen=train&ajaxaction=train&mode=train`;
+         
+         const baseUrlMatch = getRefererUrl.match(/^(https?:\/\/[^\/]+)/);
+         if (!baseUrlMatch) throw new Error('Erro URL base.');
+         const baseUrl = baseUrlMatch[1]; 
+         const postRefererUrl = baseUrl + url;
+
+         // **CORREÇÃO 2 (POST): Stringified function**
+         const recruitResponse = await page.evaluate(`
+            async ({ url, payload, referer }) => {
+                 try {
+                     const body = new URLSearchParams(payload).toString();
+                     const res = await fetch(url, {
+                         method: 'POST',
+                         headers: {
+                             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                             'Accept': 'application/json, text/javascript, */*',
+                             'TribalWars-Ajax': '1',
+                             'X-Requested-With': 'XMLHttpRequest',
+                             'Referer': referer 
+                         },
+                         body: body
+                     });
+                     if (!res.ok) return { error: 'Network error: ' + res.statusText };
+                     
+                     const text = await res.text();
+                     if (text.startsWith('<')) {
+                        return { error: 'Server returned HTML instead of JSON.' };
+                     }
+                     return JSON.parse(text);
+                 } catch (e) {
+                     return { error: 'Fetch error: ' + e.message };
+                 }
+            }
+         `, { url: recruitUrl, payload: payload, referer: postRefererUrl });
+
+         if (recruitResponse.error) throw new Error(recruitResponse.error);
+
+         if (recruitResponse.success) {
+             if (recruitResponse.game_data && recruitResponse.game_data.village) {
+                 return recruitResponse.game_data.village;
+             }
+             return null;
+         } else {
+              console.warn(`[Recruitment-${accountId}] Falha:`, recruitResponse.msg);
+              return null;
+         }
+
+    } catch (error) {
+         console.error(`[Recruitment-${accountId}] Erro fatal:`, error);
+         return null;
+    }
+}
+
+module.exports = { execute };
+
+====================
+ARQUIVO: .\src\main\automation_modules\research.cjs
+====================
+
+
+====================
+ARQUIVO: .\src\main\automation_modules\rewards.cjs
+====================
+// src/main/automation_modules/rewards.cjs (CORRIGIDO PARA BYTENODE)
+const { randomWait } = require('../utils/helpers.cjs');
+
+async function execute(page, sendStatus, config, gameState) {
+    const accountId = config.accountId;
+    const villageId = config.villageId;
+    const csrfToken = gameState.csrfToken;
+
+    if (!csrfToken) return;
+
+    const rewardsToCollect = gameState.collectableRewards || [];
+    if (rewardsToCollect.length === 0) return;
+
+    sendStatus('EM_EXECUÇÃO', `Coletando recompensas...`);
+    const collectUrl = `/game.php?village=${villageId}&screen=new_quests&ajax=claim_reward`;
+    const refererUrl = page.url();
+    let coletadas = 0;
+
+    try {
+        for (const reward of rewardsToCollect) {
+            if (!process.connected) return;
+            const payload = { reward_id: reward.reward_id, h: csrfToken };
+            const bodyPayload = new URLSearchParams(payload).toString();
+
+            // **CORREÇÃO**: Stringified function
+            const result = await page.evaluate(`
+                async ({ url, bodyString, referer }) => {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                'Accept': 'application/json, text/javascript, */*',
+                                'TribalWars-Ajax': '1',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Referer': referer
+                            },
+                            body: bodyString
+                        });
+                        if (!response.ok) return { error: 'Network error: ' + response.statusText };
+                        return await response.json();
+                    } catch (e) {
+                        return { error: 'Fetch error: ' + e.message };
+                    }
+                }
+            `, { url: collectUrl, bodyString: bodyPayload, referer: refererUrl });
+
+            if (result?.response?.claimed?.id) {
+                coletadas++;
+            } else {
+                if (result.error || result.response === false) {
+                    sendStatus('EM_EXECUÇÃO', `Falha ao coletar recompensa.`);
+                }
+            }
+            await randomWait(2500, 4500);
+        }
+    } catch (error) {
+        console.error(`[Rewards-${accountId}] Erro:`, error);
+    }
+}
+
+module.exports = { execute };
+
+====================
+ARQUIVO: .\src\main\automation_modules\scavenger.cjs
+====================
+// src/main/automation_modules/scavenger.cjs (CORRIGIDO PARA BYTENODE)
+const { randomWait } = require('../utils/helpers.cjs');
+
+const WEIGHTS = { "1": 15, "2": 6, "3": 3, "4": 2 };
+const MIN_INFANTRY_TO_SCAVENGE = 10;
+const CARRY_CAPACITY = { spear: 25, sword: 15 };
+const UNLOCK_COSTS = {
+    "1": { wood: 25, stone: 30, iron: 25 },
+    "2": { wood: 250, stone: 300, iron: 250 },
+    "3": { wood: 1000, stone: 1200, iron: 1000 },
+    "4": { wood: 10000, stone: 12000, iron: 10000 }
+};
+
+async function execute(page, sendStatus, config, gameState) {
+    const accountId = config.accountId;
+    const csrfToken = gameState.csrfToken;
+    let newScavengeState = null;
+
+    if (!csrfToken || !gameState.scavengeInfo?.options) return newScavengeState;
+    
+    const options = gameState.scavengeInfo.options;
+    const troopsAvailable = gameState.scavengeInfo.unit_counts_home || {};
+    const totalSpears = troopsAvailable.spear || 0;
+    const totalSwords = troopsAvailable.sword || 0;
+    const totalInfantryPool = totalSpears + totalSwords;
+    const currentRes = gameState.resources;
+
+    try {
+        // --- Desbloqueio ---
+        let unlockedSomething = false;
+        for (const optionId in options) {
+            const option = options[optionId];
+            if (option.is_locked === true && option.unlock_time === null) {
+                if (unlockedSomething) continue;
+                if (!checkResourcesForUnlock(accountId, currentRes, UNLOCK_COSTS[optionId], optionId)) continue;
+
+                sendStatus('EM_EXECUÇÃO', `Desbloqueando opção ${optionId}...`);
+                const unlockResult = await unlockScavengeOption(page, config, csrfToken, optionId);
+                if (unlockResult) {
+                    unlockedSomething = true;
+                    newScavengeState = unlockResult;
+                }
+            }
+        }
+        
+        // --- Envio de Tropas ---
+        const freeSlots = [];
+        const currentOptionsState = newScavengeState ? (newScavengeState.options || options) : options;
+        
+        for (const optionId in currentOptionsState) {
+            const opt = currentOptionsState[optionId];
+            if (opt.scavenging_squad === null && opt.is_locked === false) {
+                freeSlots.push(optionId);
+            }
+        }
+
+        if (freeSlots.length === 0 || totalInfantryPool < MIN_INFANTRY_TO_SCAVENGE) return newScavengeState;
+
+        let totalWeight = 0;
+        for (const id of freeSlots) totalWeight += WEIGHTS[id] || 0;
+        if (totalWeight === 0) return newScavengeState;
+
+        const spearProportion = totalSpears / totalInfantryPool;
+        let spearsAllocated = 0;
+        let swordsAllocated = 0;
+        const troopsToAllocate = {};
+
+        for (let i = 0; i < freeSlots.length - 1; i++) {
+            const optionId = freeSlots[i];
+            const totalTroopsForSlot = Math.floor(totalInfantryPool * (WEIGHTS[optionId] / totalWeight));
+            const spearsForSlot = Math.floor(totalTroopsForSlot * spearProportion);
+            const swordsForSlot = totalTroopsForSlot - spearsForSlot;
+            troopsToAllocate[optionId] = { spear: spearsForSlot, sword: swordsForSlot };
+            spearsAllocated += spearsForSlot;
+            swordsAllocated += swordsForSlot;
+        }
+        
+        const lastSlotId = freeSlots[freeSlots.length - 1];
+        troopsToAllocate[lastSlotId] = {
+            spear: totalSpears - spearsAllocated,
+            sword: totalSwords - swordsAllocated
+        };
+
+        for (const optionId in troopsToAllocate) {
+            const troops = troopsToAllocate[optionId];
+            const carryCapacity = (troops.spear * CARRY_CAPACITY.spear) + (troops.sword * CARRY_CAPACITY.sword);
+            if (troops.spear > 0 || troops.sword > 0) {
+                const sendResult = await sendScavengeSquad(page, config, csrfToken, optionId, troops, carryCapacity);
+                if (sendResult) newScavengeState = sendResult;
+                await randomWait(500, 1500);
+            }
+        }
+        
+        return newScavengeState;
+
+    } catch (error) {
+        console.error(`[Scavenger-${accountId}] Erro:`, error);
+        return newScavengeState;
+    }
+}
+
+function checkResourcesForUnlock(accountId, currentRes, costs, optionId) {
+    return !(currentRes.wood < costs.wood || currentRes.clay < costs.stone || currentRes.iron < costs.iron);
+}
+
+// --- CORREÇÃO: Funções 'evaluate' convertidas para String ---
+
+async function unlockScavengeOption(page, config, csrfToken, optionId) {
+    const url = `/game.php?village=${config.villageId}&screen=scavenge_api&ajaxaction=start_unlock`;
+    const payload = { village_id: config.villageId, option_id: optionId, h: csrfToken };
+    const bodyPayload = new URLSearchParams(payload).toString();
+    const refererUrl = page.url();
+
+    const result = await page.evaluate(`
+        async ({ url, bodyString, referer }) => {
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Accept': 'application/json, text/javascript, */*',
+                        'TribalWars-Ajax': '1',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': referer
+                    },
+                    body: bodyString
+                });
+                if (!response.ok) return { error: 'Network error: ' + response.statusText };
+                return await response.json();
+            } catch (e) {
+                return { error: 'Fetch error: ' + e.message };
+            }
+        }
+    `, { url, bodyString: bodyPayload, referer: refererUrl });
+
+    if (result.response && result.response.village) {
+        return result.response.village; 
+    }
+    return null; 
+}
+
+async function sendScavengeSquad(page, config, csrfToken, optionId, troops, carryCapacity) {
+    const url = `/game.php?village=${config.villageId}&screen=scavenge_api&ajaxaction=send_squads`;
+    const payload = {
+        'squad_requests[0][village_id]': config.villageId,
+        'squad_requests[0][option_id]': optionId,
+        'squad_requests[0][use_premium]': 'false',
+        'squad_requests[0][candidate_squad][unit_counts][spear]': troops.spear || 0,
+        'squad_requests[0][candidate_squad][unit_counts][sword]': troops.sword || 0,
+        'squad_requests[0][candidate_squad][unit_counts][axe]': 0,
+        'squad_requests[0][candidate_squad][unit_counts][archer]': 0,
+        'squad_requests[0][candidate_squad][unit_counts][light]': 0,
+        'squad_requests[0][candidate_squad][unit_counts][marcher]': 0,
+        'squad_requests[0][candidate_squad][unit_counts][heavy]': 0,
+        'squad_requests[0][candidate_squad][unit_counts][knight]': 0,
+        'squad_requests[0][candidate_squad][carry_max]': carryCapacity,
+        'h': csrfToken
+    };
+    const bodyPayload = new URLSearchParams(payload).toString();
+    const refererUrl = page.url(); 
+
+    const result = await page.evaluate(`
+        async ({ url, bodyString, referer }) => {
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Accept': 'application/json, text/javascript, */*',
+                        'TribalWars-Ajax': '1',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': referer
+                    },
+                    body: bodyString
+                });
+                if (!response.ok) return { error: 'Network error: ' + response.statusText };
+                return await response.json();
+            } catch (e) {
+                return { error: 'Fetch error: ' + e.message };
+            }
+        }
+    `, { url, bodyString: bodyPayload, referer: refererUrl });
+
+    if (result.response && result.response.villages && result.response.villages[config.villageId]) {
+        return result.response.villages[config.villageId] || null;
+    }
+    return null;
+}
+
+module.exports = { execute };
+
+====================
+ARQUIVO: .\src\main\automation_modules\state_extractor.cjs
+====================
+// src/main/automation_modules/state_extractor.cjs (CORRIGIDO PARA BYTENODE)
+console.log('[StateExtractor] Módulo carregado.');
+const { sleep, randomWait } = require('../utils/helpers.cjs');
+
+async function fetchScavengeData(page, villageId) {
+    try {
+        // **CORREÇÃO 1: jQuery AJAX via string**
+        const villageObject = await page.evaluate(`
+            async (vid) => {
+                return new Promise(async (resolve, reject) => {
+                    const fullUrl = 'game.php?village=' + vid + '&screen=place&mode=scavenge';
+                    try {
+                        // Usa jQuery da página se disponível, ou fetch
+                        let htmlContent;
+                        if (typeof jQuery !== 'undefined') {
+                             const response = await jQuery.ajax({
+                                url: fullUrl,
+                                type: 'GET',
+                                cache: false,
+                                dataType: 'text'
+                            });
+                            htmlContent = response;
+                        } else {
+                             const resp = await fetch(fullUrl);
+                             htmlContent = await resp.text();
+                        }
+
+                        if (!htmlContent) return reject('Conteúdo vazio.');
+
+                        const objectMatch = htmlContent.match(/var\\s+village\\s+=\\s*(\\{[\\s\\S]*?\\})\\s*;/);
+                        if (objectMatch && objectMatch[1]) {
+                            try {
+                                const jsString = '(' + objectMatch[1] + ')';
+                                const villageData = eval(jsString);
+                                return resolve(villageData);
+                            } catch (e) {
+                                return reject('Eval error: ' + e.message);
+                            }
+                        }
+                        return reject('Objeto village não encontrado.');
+                    } catch (e) {
+                        reject('AJAX error: ' + (e.message || e));
+                    }
+                });
+            }
+        `, villageId);
+        
+        return villageObject;
+    } catch (error) {
+        console.error(`[StateExtractor] Erro scavenge data: ${error.message}`);
+        return null;
+    }
+}
+
+async function execute(page, sendStatus, config) {
+    const accountId = config.accountId;
+    const villageId = config.villageId;
+    let mainUrl = ''; 
+
+    console.log(`[StateExtractor-${accountId}] Iniciando extração...`);
+    try {
+        const targetUrlPart = `village=${villageId}&screen=main`;
+        const currentUrl = page.url();
+
+        if (!currentUrl.includes(targetUrlPart)) {
+            const baseUrlMatch = currentUrl.match(/^(https?:\/\/[^\/]+)/);
+            if (!baseUrlMatch) throw new Error(`Erro URL base.`);
+            const baseUrl = baseUrlMatch[1];
+            mainUrl = `${baseUrl}/game.php?village=${villageId}&screen=main`;
+            await page.goto(mainUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForSelector('#buildings', { timeout: 15000 });
+            await randomWait(1000, 3000);
+        } else {
+            mainUrl = currentUrl.split('?')[0] + `?village=${villageId}&screen=main`;
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForSelector('#buildings', { timeout: 15000 });
+            await randomWait(500, 1500);
+        }
+        
+        // **CORREÇÃO 2: game_data via string**
+        let gameData = null;
+        let attempts = 0;
+        while (!gameData && attempts < 3) {
+            attempts++;
+            gameData = await page.evaluate("typeof window.game_data !== 'undefined' ? JSON.parse(JSON.stringify(window.game_data)) : null");
+            if (gameData) break;
+            if (attempts < 3) await sleep(1000 * attempts);
+        }
+
+        if (!gameData || !gameData.village || !gameData.player || !gameData.csrf) return null; 
+        if (String(gameData.village.id) !== String(villageId)) return null; 
+
+        // **CORREÇÃO 3: BuildingMain via string**
+        const buildingsData = await page.evaluate("typeof window.BuildingMain !== 'undefined' && window.BuildingMain.buildings ? JSON.parse(JSON.stringify(window.BuildingMain.buildings)) : null");
+
+        let completedMissions = [];
+        let collectableRewards = [];
+        const questUrl = `/game.php?village=${villageId}&screen=new_quests&ajax=quest_popup&tab=main-tab&quest=0`;
+        const refererUrl = mainUrl;
+
+        try {
+            // **CORREÇÃO 4: Extração de quests complexa via string**
+            // Como a função é grande, passamos tudo como string.
+            const extractedData = await page.evaluate(`
+                async ({ url, referer }) => {
+                    function extractBalancedArray(text, startString) {
+                        const startIndex = text.indexOf(startString);
+                        if (startIndex === -1) return null;
+                        const arrayStartIndex = text.indexOf('[', startIndex + startString.length);
+                        if (arrayStartIndex === -1) return null;
+                        let balance = 0;
+                        let inString = false;
+                        let arrayEndIndex = -1;
+                        for (let i = arrayStartIndex; i < text.length; i++) {
+                            const char = text[i];
+                            if (char === '"' && text[i - 1] !== '\\\\') { inString = !inString; }
+                            if (inString) continue;
+                            if (char === '[') balance++;
+                            else if (char === ']') balance--;
+                            if (balance === 0) {
+                                arrayEndIndex = i + 1;
+                                break;
+                            }
+                        }
+                        if (arrayEndIndex === -1) return null;
+                        return text.substring(arrayStartIndex, arrayEndIndex);
+                    }
+                    
+                    const missions = [];
+                    const rewards = [];
+                    try {
+                        const response = await fetch(url, {
+                            method: 'GET',
+                            headers: {
+                                'Accept': 'application/json, text/javascript, */*',
+                                'TribalWars-Ajax': '1',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Referer': referer
+                            }
+                        });
+                        if (!response.ok) return { missions, rewards, error: 'Network error' };
+                        const data = await response.json();
+                        if (!data || !data.response || !data.response.dialog) return { missions, rewards, error: 'Invalid JSON' };
+                        
+                        const html = data.response.dialog;
+                        const questArrayString = extractBalancedArray(html, "Questlines.setQuests(");
+                        const rewardArrayString = extractBalancedArray(html, "RewardSystem.setRewards(");
+
+                        if (questArrayString) {
+                            try {
+                                const questlines = JSON.parse(questArrayString);
+                                for (const questline of questlines) {
+                                    if (questline.quests && Array.isArray(questline.quests)) {
+                                        for (const quest of questline.quests) {
+                                            if (quest.finished === true && quest.id) {
+                                                missions.push({ reward_id: String(quest.id) });
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+
+                        if (rewardArrayString) {
+                            try {
+                                const rewardData = JSON.parse(rewardArrayString);
+                                for (const rewardData_1 of rewardData) {
+                                    if (rewardData_1.id && rewardData_1.status === 'unlocked') {
+                                        rewards.push({ reward_id: String(rewardData_1.id) });
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        return { missions, rewards, error: null };
+                    } catch (e) {
+                        return { missions: [], rewards: [], error: e.message };
+                    }
+                }
+            `, { url: questUrl, referer: refererUrl });
+
+            if (!extractedData.error) {
+                completedMissions = extractedData.missions;
+                collectableRewards = extractedData.rewards;
+            }
+        } catch (questError) {
+            console.warn(`[StateExtractor] Erro quests: ${questError.message}`);
+        }
+
+        const scavengeData = await fetchScavengeData(page, villageId);
+
+        // **CORREÇÃO 5: Fila de Construção DOM via string**
+        const constructionQueue = await page.evaluate(`
+             () => {
+                 const queueTable = document.getElementById('build_queue');
+                 if (!queueTable) return [];
+                 const rows = queueTable.querySelectorAll('tbody tr[class*="buildorder_"]');
+                 const queue = [];
+                 rows.forEach(row => {
+                     try {
+                         const buildingMatch = row.className.match(/buildorder_(\\w+)/);
+                         if (!buildingMatch) return;
+                         const buildingId = buildingMatch[1];
+                         const nameLevelElement = row.querySelector('td:first-child');
+                         let level = 0;
+                         if (nameLevelElement) {
+                             const rawText = nameLevelElement.innerText.trim();
+                             const nameMatch = rawText.match(/^(.+)\\s*Nível\\s*(\\d+)/i);
+                             if (nameMatch && nameMatch.length === 3) {
+                                level = parseInt(nameMatch[2], 10);
+                             }
+                         }
+                         if (buildingId !== 'unknown' && level > 0) {
+                              queue.push({ buildingId: buildingId, level: level });
+                         }
+                     } catch(e) {}
+                 });
+                 return queue;
+             }
+        `);
+
+        const gameState = {
+            timestamp: Date.now(),
+            villageId: gameData.village.id,
+            villageName: gameData.village.name,
+            village: gameData.village,
+            player: gameData.player,
+            buildingsData: buildingsData,
+            constructionQueue: constructionQueue,
+            csrfToken: gameData.csrf,
+            completedMissions: completedMissions,
+            collectableRewards: collectableRewards,
+            scavengeInfo: scavengeData
+        };
+
+        // Normalização
+        gameState.buildings = gameState.village?.buildings || {};
+        gameState.resources = {
+            wood: gameState.village?.wood ?? 0,
+            clay: gameState.village?.stone ?? 0,
+            iron: gameState.village?.iron ?? 0,
+            storage: { max: gameState.village?.storage_max ?? 0 },
+        };
+        gameState.population = {
+            current: gameState.village?.pop ?? 0,
+            max: gameState.village?.pop_max ?? 0,
+        };
+
+        sendStatus('EM_EXECUÇÃO', 'Estado extraído.');
+        return gameState;
+
+    } catch (error) {
+        console.error(`[StateExtractor-${accountId}] Erro:`, error);
+        return null; 
+    }
+}
+
+module.exports = { execute };
+
+====================
+ARQUIVO: .\src\main\services\dashboard_service.cjs
+====================
+// src/main/services/dashboard_service.cjs (Versão Segura + Debug Logs de Tipo)
+
+/**
+ * Constrói o View Model de recursos e o envia para o Main Process (index.cjs)
+ * para ser retransmitido à UI (React).
+ *
+ * @param {string} currentAccountId - O ID da conta para taguear a mensagem.
+ * @param {Object} gameState - O objeto de estado extraído (window.game_data).
+ */
+function updateDashboardState(currentAccountId, gameState) {
+    // Validação inicial (mantida)
+    if (!currentAccountId) {
+        console.error('[DashboardService] Tentativa de notificar UI sem currentAccountId.');
+        return;
+    }
+
+    // Validação MÍNIMA: Garante que gameState existe
+    if (!gameState) {
+         console.warn(`[DashboardService-${currentAccountId}] Tentativa de notificar UI com gameState nulo ou undefined.`);
+         return; // Retorna se o gameState inteiro for nulo
+    }
+
+    try {
+        // **** ADICIONE ESTES LOGS DE TIPO ****
+        console.log(`[DashboardService-${currentAccountId}] DEBUG: Tipo de gameState.village: ${typeof gameState.village}`);
+        if(gameState.village) {
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.village.wood: ${gameState.village.wood}, Tipo: ${typeof gameState.village.wood}`);
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.village.stone: ${gameState.village.stone}, Tipo: ${typeof gameState.village.stone}`);
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.village.iron: ${gameState.village.iron}, Tipo: ${typeof gameState.village.iron}`);
+             // Log adicional para as propriedades float, caso sejam elas as corretas
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.village.wood_float: ${gameState.village.wood_float}, Tipo: ${typeof gameState.village.wood_float}`);
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.village.stone_float: ${gameState.village.stone_float}, Tipo: ${typeof gameState.village.stone_float}`);
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.village.iron_float: ${gameState.village.iron_float}, Tipo: ${typeof gameState.village.iron_float}`);
+        } else {
+             console.warn(`[DashboardService-${currentAccountId}] DEBUG: gameState.village está undefined ou nulo.`);
+        }
+        console.log(`[DashboardService-${currentAccountId}] DEBUG: Tipo de gameState.player: ${typeof gameState.player}`);
+        if(gameState.player) {
+             console.log(`[DashboardService-${currentAccountId}] DEBUG: Valor gameState.player.points: ${gameState.player.points}, Tipo: ${typeof gameState.player.points}`);
+        } else {
+             console.warn(`[DashboardService-${currentAccountId}] DEBUG: gameState.player está undefined ou nulo.`);
+        }
+        // **** FIM DOS LOGS ADICIONADOS ****
+
+        // **** INÍCIO DA MODIFICAÇÃO: Construção Segura do viewModel **** (Código existente)
+        const viewModel = {
+            // Usa optional chaining (?.) e nullish coalescing (??) para evitar erros
+            // Se gameState.player ou gameState.player.points não existirem, usa 0
+            playerPoints: Math.floor(gameState.player?.points ?? 0),
+            resources: {
+                // Se gameState.village ou gameState.village.wood não existirem, usa 0
+                // **ATENÇÃO:** Usar wood_float, stone_float, iron_float se os logs mostrarem que wood/stone/iron não são os corretos
+                wood: Math.floor(gameState.village?.wood ?? 0), // <- VERIFICAR logs se deve ser wood_float
+                clay: Math.floor(gameState.village?.stone ?? 0), // <- VERIFICAR logs se deve ser stone_float (Mapeamento: gameData.village.stone -> viewModel.resources.clay)
+                iron: Math.floor(gameState.village?.iron ?? 0), // <- VERIFICAR logs se deve ser iron_float
+                population: {
+                    current: gameState.village?.pop ?? 0,
+                    max: gameState.village?.pop_max ?? 0
+                },
+                storage: {
+                    max: gameState.village?.storage_max ?? 0
+                }
+            }
+        };
+        // **** FIM DA MODIFICAÇÃO ****
+
+        // Log para depuração (opcional, pode remover depois)
+        console.log(`[DashboardService-${currentAccountId}] Enviando viewModel:`, JSON.stringify(viewModel));
+
+        // Envia os dados para o Main Process (index.cjs) via IPC
+        if (process.connected) {
+            process.send({
+                type: 'dashboard-update', // Canal que o React (via Preload) espera
+                accountId: currentAccountId,
+                state: viewModel, // Envia o objeto 'state' completo
+                timestamp: new Date().toISOString()
+            });
+        } else {
+             console.warn(`[DashboardService-${currentAccountId}] Canal IPC desconectado, não é possível enviar dashboard-update.`);
+        }
+
+    } catch (error) {
+        // Captura erros inesperados da construção do objeto ou do process.send()
+        console.error(`[DashboardService-${currentAccountId}] Falha INESPERADA ao construir ou enviar o View Model: ${error.message}`, error); // Log do erro completo
+    }
+}
+
+module.exports = {
+    updateDashboardState
+};
+
+====================
+ARQUIVO: .\src\main\utils\helpers.cjs
+====================
+// src/main/utils/helpers.cjs (CORRIGIDO E MESCLADO)
+
+const util = require('util');
+const axios = require('axios'); // Dependência para testProxy
+const { URL } = require('url');   // Dependência para testProxy
+const setTimeoutPromise = util.promisify(setTimeout);
+
+/**
+ * Aguarda um tempo fixo (em milissegundos).
+ * @param {number} ms - O tempo de espera em milissegundos.
+ */
+async function sleep(ms) {
+    await setTimeoutPromise(ms);
+}
+
+/**
+ * Aguarda um tempo aleatório dentro de um intervalo.
+ * @param {number} minMs - Tempo mínimo de espera.
+ * @param {number} maxMs - Tempo máximo de espera.
+ */
+async function randomWait(minMs, maxMs) {
+    const waitTime = minMs + Math.random() * (maxMs - minMs);
+    await setTimeoutPromise(waitTime);
+}
+
+/**
+ * Simula um clique mais humano.
+ * Move o mouse sobre o elemento, espera um pouco e então clica.
+ * @param {import('playwright').Locator} locator - O localizador do Playwright para clicar.
+ * @param {number} [minHoverMs=150] - Tempo mínimo de espera após o hover.
+ * @param {number} [maxHoverMs=450] - Tempo máximo de espera após o hover.
+ */
+async function humanClick(locator, minHoverMs = 150, maxHoverMs = 450) {
+    if (!locator) {
+        console.error('humanClick recebeu um localizador nulo ou indefinido.');
+        return;
+    }
+    
+    try {
+        // 1. Move o mouse sobre o elemento
+        await locator.hover({ timeout: 5000 }); 
+        
+        // 2. Espera um tempo aleatório (simulando cognição)
+        await randomWait(minHoverMs, maxHoverMs);
+
+        // 3. Clica
+        await locator.click({ timeout: 5000, delay: Math.random() * 100 }); // Adiciona um pequeno delay ao clique
+
+    } catch (error) {
+        console.warn(`[humanClick] Falha no clique humano: ${error.message}. Tentando clique forçado.`);
+        // Fallback: Se o hover/clique normal falhar (ex: elemento coberto)
+        try {
+            await locator.click({ timeout: 5000, force: true });
+        } catch (forceClickError) {
+             console.error(`[humanClick] Falha no clique forçado: ${forceClickError.message}`);
+             // Propaga o erro se até o clique forçado falhar
+             throw forceClickError;
+        }
+    }
+}
+
+/**
+ * (Vindo da Refatoração)
+ * Testa a conexão de um proxy fazendo uma requisição leve.
+ * @param {object} proxyConfig - { server: 'ip:port', username: 'user', password: 'pw' }
+ * @param {string} accountId - (Para logs)
+ * @returns {Promise<boolean>} - True se funcionar, false se falhar.
+ */
+async function testProxy(proxyConfig, accountId = 'unknown') {
+    if (!proxyConfig || !proxyConfig.server) {
+        console.warn(`[helper/testProxy-${accountId}] Teste de proxy pulado: Nenhuma configuração.`);
+        return true;
+    }
+
+    try {
+        let serverString = proxyConfig.server;
+        
+        // Garante que o protocolo http:// esteja presente
+        if (!serverString.startsWith('http://') && !serverString.startsWith('https://')) {
+            serverString = `http://${serverString}`;
+        }
+        
+        const proxyUrl = new URL(serverString);
+        const axiosProxyConfig = {
+            protocol: proxyUrl.protocol.replace(':', ''),
+            host: proxyUrl.hostname,
+            port: parseInt(proxyUrl.port, 10),
+            auth: undefined
+        };
+        if (proxyConfig.username) {
+            axiosProxyConfig.auth = {
+                username: proxyConfig.username,
+                password: proxyConfig.password
+            };
+        }
+
+        const targetUrl = 'https://api.ipify.org'; // URL leve para teste
+        console.log(`[helper/testProxy-${accountId}] Testando proxy: ${axiosProxyConfig.protocol}://${axiosProxyConfig.host}:${axiosProxyConfig.port}...`);
+        await axios.get(targetUrl, {
+            proxy: axiosProxyConfig,
+            timeout: 15000 // 15 segundos
+        });
+        console.log(`[helper/testProxy-${accountId}] Teste de proxy bem-sucedido.`);
+        return true;
+
+    } catch (error) {
+        if (error instanceof TypeError && error.message.includes('Invalid URL')) {
+             console.error(`[helper/testProxy-${accountId}] Falha CRÍTICA: String '${proxyConfig.server}' é uma URL inválida.`);
+        } else {
+            console.error(`[helper/testProxy-${accountId}] Falha no teste de proxy:`, error.message);
+            if (error.code === 'ECONNABORTED') {
+                console.error(`[helper/testProxy-${accountId}] O proxy atingiu o timeout de 15s.`);
+            }
+        }
+        return false;
+    }
+}
+
+/**
+ * (Vindo da Refatoração)
+ * Verifica rapidamente se algum seletor de CAPTCHA está visível.
+ * @param {import('playwright').Page} page
+ * @param {string} accountId - (Para logs)
+ * @returns {Promise<boolean>} - True se CAPTCHA for detectado.
+ */
+async function checkForCaptcha(page, accountId = 'unknown') {
+    const CAPTCHA_SELECTORS = [
+        '#botprotection_quest',
+        'td.bot-protection-row',
+        'div.captcha'
+    ];
+    try {
+        // Validação da página adicionada para robustez
+        if (!page || page.isClosed()) {
+             console.warn(`[helper/captcha-${accountId}] Verificação de CAPTCHA pulada, página está fechada.`);
+             return false;
+        }
+        const racePromises = CAPTCHA_SELECTORS.map(selector => 
+            page.waitForSelector(selector, { state: 'visible', timeout: 2000 })
+        );
+        await Promise.race(racePromises);
+        
+        console.warn(`[helper/captcha-${accountId}] DETECÇÃO DE CAPTCHA: Seletor encontrado.`);
+        return true;
+    } catch (error) {
+        // Timeout é o esperado (sem CAPTCHA)
+        return false;
+    }
+}
+
+
+module.exports = {
+    sleep,
+    randomWait,
+    humanClick,
+    testProxy,
+    checkForCaptcha
+};
+
+====================
+ARQUIVO: .\src\main\worker_core\apiService.cjs
+====================
+// src/main/worker_core/apiService.cjs (NOVO)
+// Gerencia TODAS as chamadas de rede para o backend VPS.
+// Lida automaticamente com o refresh de access tokens.
+
+const axios = require('axios');
+const ipcService = require('./ipcService.cjs');
+
+const BACKEND_BASE_URL = 'http://157.173.106.162:5000';
+
+// Armazenamento em memória dos tokens (específico deste worker)
+const tokenStore = {
+    authToken: null,
+    refreshToken: null
+};
+
+let isRefreshing = false;
+let failedQueue = [];
+
+/**
+ * Processa a fila de requisições pendentes após um refresh.
+ * @param {Error | null} error 
+ * @param {string | null} token 
+ */
+function processQueue(error, token = null) {
+    failedQueue.forEach(prom => {
+        if (error) {
+            prom.reject(error);
+        } else {
+            prom.resolve(token);
+        }
+    });
+    failedQueue = [];
+}
+
+/**
+ * Instância 'api' principal: para chamadas autenticadas.
+ */
+const api = axios.create({
+    baseURL: BACKEND_BASE_URL,
+    timeout: 20000 // 20 segundos de timeout
+});
+
+/**
+ * Instância 'authApi': para chamadas de refresh (evita loop de interceptor).
+ */
+const authApi = axios.create({
+    baseURL: BACKEND_BASE_URL,
+    timeout: 20000
+});
+
+// Interceptor de Requisição: Injeta o token.
+api.interceptors.request.use(
+    (config) => {
+        if (tokenStore.authToken) {
+            config.headers['Authorization'] = `Bearer ${tokenStore.authToken}`;
+        }
+        return config;
+    },
+    (error) => Promise.reject(error)
+);
+
+// Interceptor de Resposta: Lida com 401 (Token Expirado).
+api.interceptors.response.use(
+    (response) => response, // Sucesso
+    async (error) => {
+        const originalRequest = error.config;
+        
+        // Se não for 401, ou se for uma falha na rota de refresh, rejeita direto
+        if (error.response?.status !== 401 || originalRequest.url === '/api/auth/refresh') {
+            return Promise.reject(error);
+        }
+
+        // Evita "Race Condition" de múltiplos 401
+        if (isRefreshing) {
+            return new Promise((resolve, reject) => {
+                failedQueue.push({ resolve, reject });
+            }).then(token => {
+                originalRequest.headers['Authorization'] = `Bearer ${token}`;
+                return api(originalRequest);
+            });
+        }
+
+        isRefreshing = true;
+        originalRequest._retry = true;
+
+        if (!tokenStore.refreshToken) {
+            console.error('[apiService] 401 detectado, mas não há refreshToken. Encerrando.');
+            ipcService.sendStatus('FALHA!', 'Sessão expirada (sem refresh token).');
+            process.exit(1); // Encerra o worker
+        }
+
+        try {
+            console.warn('[apiService] Access token expirou. Tentando refresh...');
+            const response = await authApi.post('/api/auth/refresh', {
+                refreshToken: tokenStore.refreshToken
+            });
+
+            const newAccessToken = response.data.accessToken;
+            if (!newAccessToken) throw new Error('Refresh não retornou um novo accessToken.');
+
+            console.log('[apiService] Refresh bem-sucedido. Novo access token obtido.');
+            
+            // 1. Atualiza o token local
+            tokenStore.authToken = newAccessToken;
+            
+            // 2. Notifica o Main Process para salvar o novo token
+            ipcService.sendTokenUpdate(newAccessToken);
+
+            // 3. Atualiza o header da requisição original
+            originalRequest.headers['Authorization'] = `Bearer ${newAccessToken}`;
+
+            // 4. Libera a fila de requisições pendentes
+            processQueue(null, newAccessToken);
+            
+            // 5. Re-tenta a requisição original
+            return api(originalRequest);
+
+        } catch (refreshError) {
+            console.error('[apiService] Falha CRÍTICA no refresh token:', refreshError.response?.data?.message || refreshError.message);
+            
+            ipcService.sendStatus('FALHA!', 'Sessão expirada. Faça login novamente no app.');
+            processQueue(refreshError, null);
+            process.exit(1); // Encerra o worker, pois a sessão é inválida
+            
+            return Promise.reject(refreshError);
+        } finally {
+            isRefreshing = false;
+        }
+    }
+);
+
+/**
+ * Inicializa o serviço com os tokens.
+ * @param {{authToken: string, refreshToken: string}} config 
+ */
+function init(config) {
+    tokenStore.authToken = config.authToken;
+    tokenStore.refreshToken = config.refreshToken;
+    console.log('[apiService] Inicializado com tokens.');
+}
+
+module.exports = {
+    init,
+    /**
+     * Instância Axios para chamadas de API autenticadas.
+     * Automaticamente lida com refresh de token.
+     */
+    api
+};
+
+====================
+ARQUIVO: .\src\main\worker_core\authService.cjs
+====================
+const chromium = require('playwright-extra').chromium;
+const stealth = require('puppeteer-extra-plugin-stealth')();
+chromium.use(stealth);
+
+const { sleep, testProxy } = require('../utils/helpers.cjs');
+const ipcService = require('./ipcService.cjs');
+
+async function loginAndSelectWorld(config) {
+    const { session, region, tw_world, villageId, accountId } = config;
+    const proxyConfig = session.proxy;
+    let browser, context, page;
+
+    try {
+        const contextOptions = {
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            viewport: { width: 1366, height: 768 },
+            proxy: undefined 
+        };
+
+        if (proxyConfig && proxyConfig.server) {
+            console.log(`[authService-${accountId}] Configurando proxy: ${proxyConfig.server}`);
+            
+            const proxySettings = {
+                server: proxyConfig.server, 
+                username: proxyConfig.username,
+                password: proxyConfig.password
+            };
+            
+            ipcService.sendStatus('INICIANDO...', 'Testando proxy...');
+            
+            const isProxyOk = await testProxy(proxySettings, accountId);
+            if (!isProxyOk) {
+                ipcService.sendProxyStatus('invalid');
+                throw new Error('Falha na conexão com o proxy.');
+            }
+            
+            ipcService.sendProxyStatus('valid');
+            contextOptions.proxy = proxySettings;
+        } else {
+            ipcService.sendProxyStatus('not_used');
+        }
+
+        ipcService.sendStatus('INICIANDO...', 'Lançando navegador...');
+        browser = await chromium.launch({ 
+            headless: true,
+            channel: 'chrome'
+        });
+
+        context = await browser.newContext(contextOptions);
+        await context.addCookies(session.cookies);
+        await sleep(500);
+        page = await context.newPage();
+
+        const loginUrl = region === 'br' ? 'https://www.tribalwars.com.br' : 'https://www.tribalwars.com.pt';
+        ipcService.sendStatus('INICIANDO...', `Navegando para ${loginUrl}...`);
+        await page.goto(loginUrl, { waitUntil: 'load', timeout: 30000 });
+
+        try {
+            ipcService.sendStatus('INICIANDO...', 'Verificando login inicial...');
+            await page.waitForSelector('a[href="/page/logout"]', { timeout: 30000 });
+            console.log(`[authService-${accountId}] Link de logout encontrado.`);
+        } catch (logoutLinkError) {
+            throw new Error('Falha ao verificar login (link de logout não encontrado). Autentique manualmente.');
+        }
+
+        console.log(`[authService-${accountId}] Verificando seleção de mundo ou jogo...`);
+        const worldSelector = `a.world-select[href="/page/play/${region}${tw_world}"]`;
+        const gameSelector = '#header_info';
+        const raceTimeout = 30000;
+
+        try {
+            const winner = await Promise.race([
+                page.waitForSelector(worldSelector, { state: 'attached', timeout: raceTimeout }).then(() => 'world_select'),
+                page.waitForSelector(gameSelector, { state: 'visible', timeout: raceTimeout }).then(() => 'in_game')
+            ]);
+
+            if (winner === 'world_select') {
+                await handleWorldSelect(page, worldSelector, gameSelector, accountId, villageId);
+            } else if (winner === 'in_game') {
+                await handleAlreadyInGame(page, gameSelector, accountId, villageId);
+            }
+
+        } catch (raceError) {
+            console.error(`[authService-${accountId}] Erro na seleção de mundo ou bônus:`, raceError);
+            throw new Error(`Timeout ou falha após login: ${raceError.message}`);
+        }
+
+        try {
+            const currentCookies = await context.cookies();
+            if (currentCookies && currentCookies.length > 0) {
+                ipcService.sendSessionUpdate(currentCookies);
+            }
+        } catch (cookieError) {
+            console.error(`[authService-${accountId}] Erro ao obter/enviar cookies atualizados:`, cookieError);
+        }
+
+        return { browser, context, page };
+
+    } catch (error) {
+        if (page) await page.close().catch(e => {});
+        if (context) await context.close().catch(e => {});
+        if (browser) await browser.close().catch(e => {});
+        throw error;
+    }
+}
+
+async function handleWorldSelect(page, worldSelector, gameSelector, accountId, villageId) {
+    console.log(`[authService-${accountId}] Selecionando mundo...`);
+    ipcService.sendStatus('INICIANDO...', `Selecionando mundo...`);
+    
+    const worldLinkHandle = await page.waitForSelector(worldSelector, { state: 'attached', timeout: 15000 });
+    
+    await Promise.all([
+        page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }),
+        worldLinkHandle.click({ timeout: 15000, force: true })
+    ]);
+    
+    console.log(`[authService-${accountId}] Navegação de mundo concluída.`);
+
+    const dailyBonusPopupSelector = '#popup_box_daily_bonus';
+    const openBonusButtonLocator = page.locator(dailyBonusPopupSelector).locator('a.btn', { hasText: 'Abrir' });
+    const closeBonusButtonLocator = page.locator(`${dailyBonusPopupSelector} .popup_box_close`);
+
+    try {
+        console.log(`[authService-${accountId}] Verificando Bônus Diário (7s)...`);
+        await page.waitForSelector(dailyBonusPopupSelector, { state: 'visible', timeout: 7000 });
+        
+        console.log(`[authService-${accountId}] Bônus Diário detectado.`);
+        ipcService.sendStatus('EM_EXECUÇÃO', 'Lidando com bônus diário...');
+        
+        const bonusDisappearPromise = page.waitForSelector(dailyBonusPopupSelector, { state: 'hidden', timeout: 60000 });
+        
+        try {
+            await openBonusButtonLocator.waitFor({ state: 'visible', timeout: 10000 });
+            await openBonusButtonLocator.click({ timeout: 15000, force: true });
+            console.log(`[authService-${accountId}] Bônus 'Abrir' clicado.`);
+        } catch (buttonClickError) {
+            console.warn(`[authService-${accountId}] Falha ao clicar 'Abrir'. Tentando fechar popup.`);
+            if (await closeBonusButtonLocator.isVisible({ timeout: 3000 })) {
+                await closeBonusButtonLocator.click({ timeout: 5000, force: true });
+            }
+        }
+        await bonusDisappearPromise;
+        console.log(`[authService-${accountId}] Popup de Bônus fechado.`);
+        await sleep(1000);
+    } catch (bonusError) {
+        if (bonusError.name === 'TimeoutError') {
+            console.log(`[authService-${accountId}] Bônus Diário NÃO detectado.`);
+        } else {
+            throw bonusError;
+        }
+    }
+
+    await page.waitForSelector(gameSelector, { timeout: 30000 });
+    await handleAlreadyInGame(page, gameSelector, accountId, villageId, true);
+}
+
+async function handleAlreadyInGame(page, gameSelector, accountId, villageId, navigated = false) {
+    if (!navigated) {
+        console.log(`[authService-${accountId}] Já estava logado no jogo.`);
+    }
+    
+    const finalGameData = await page.evaluate(() => typeof window.game_data !== 'undefined' ? window.game_data : null);
+    
+    if (finalGameData && finalGameData.village && String(finalGameData.village.id) !== String(villageId)) {
+        console.warn(`[authService-${accountId}] Aldeia atual (${finalGameData.village.id}) não é a alvo (${villageId}). Navegando...`);
+        
+        const correctVillageUrl = page.url().replace(/village=\d+/, `village=${villageId}`);
+        await page.goto(correctVillageUrl, { waitUntil: 'load', timeout: 30000 });
+        await page.waitForSelector(gameSelector, { timeout: 30000 });
+        console.log(`[authService-${accountId}] Navegação para aldeia correta concluída.`);
+    } else {
+        console.log(`[authService-${accountId}] Entrada final no jogo confirmada (Aldeia: ${villageId}).`);
+    }
+}
+
+module.exports = { loginAndSelectWorld };
+
+====================
+ARQUIVO: .\src\main\worker_core\BotWorker.cjs
+====================
+// src/main/worker_core/BotWorker.cjs (V42 - Captura o retorno do constructionModule)
+
+const { sleep, randomWait, checkForCaptcha } = require('../utils/helpers.cjs');
+
+// Serviços
+const ipcService = require('./ipcService.cjs');
+const apiService = require('./apiService.cjs'); // Importa o serviço
+const authService = require('./authService.cjs');
+const dashboardService = require('./dashboardService.cjs');
+
+// Módulos de Automação
+const stateExtractorModule = require('../automation_modules/state_extractor.cjs');
+const missionModule = require('../automation_modules/missions.cjs');
+const rewardsModule = require('../automation_modules/rewards.cjs');
+const constructionModule = require('../automation_modules/construction.cjs');
+const scavengerModule = require('../automation_modules/scavenger.cjs');
+// --- (v22) NOVO MÓDULO ---
+const recruitmentModule = require('../automation_modules/recruitment.cjs');
+
+class BotWorker {
+    constructor() {
+        this.config = null;
+this.accountId = 'UNKNOWN';
+        
+        // Estado do Playwright
+        this.browser = null;
+        this.context = null;
+this.page = null;
+
+        // Estado do Worker
+        this.isRunning = false;
+        this.isStopping = false;
+this.cycleTimeoutId = null; 
+        
+        console.log('[BotWorker] Instância criada.');
+    }
+
+    /**
+     * Inicia o worker: Inicializa serviços, faz login e inicia o loop.
+* @param {object} config
+     */
+    async start(config) {
+        if (this.isRunning) {
+            console.warn(`[BotWorker-${config.accountId}] Comando 'start' recebido, mas já está em execução.`);
+return;
+        }
+
+        // 1. Configuração Inicial
+        this.config = config;
+this.accountId = config.accountId;
+        this.isRunning = true;
+        this.isStopping = false;
+
+        console.log(`[BotWorker-${this.accountId}] Iniciando...`);
+try {
+            // 2. Inicializa Serviços com estado
+            ipcService.init(this.accountId);
+            
+            // (v42) O apiService é inicializado AQUI
+apiService.init({
+                authToken: config.authToken,
+                refreshToken: config.refreshToken
+            });
+// 3. Login (Serviço de Autenticação)
+            // authService.loginAndSelectWorld retorna o villageId real encontrado
+            const { browser, context, page, villageId, villageName } = await authService.loginAndSelectWorld(config);
+this.browser = browser;
+            this.context = context;
+            this.page = page;
+
+            // (v39) A CORREÇÃO PRINCIPAL: Se o authService retornou um ID, usamos ele,
+            // mesmo que a config inicial (do DB) tenha vindo como null.
+            if (villageId) {
+                this.config.villageId = villageId; // Sobrescreve o null da config
+                console.log(`[BotWorker-${this.accountId}] Village ID corrigido após login: ${villageId} (${villageName}).`);
+            } else if (!this.config.villageId) {
+                console.warn(`[BotWorker-${this.accountId}] ATENÇÃO: Village ID ainda é null após login. Dependendo do StateExtractor...`);
+            }
+
+
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Login e seleção de mundo concluídos.');
+// 4. Inicia o loop
+            this.runAutomationCycle();
+} catch (error) {
+            console.error(`[BotWorker-${this.accountId}] Erro fatal durante a inicialização (start):`, error);
+ipcService.sendStatus('FALHA!', `Erro inicialização: ${error.message}`);
+            await this.stop(1);
+        }
+    }
+
+    /**
+     * Para o worker: Limpa recursos e encerra o processo.
+* @param {number} [exitCode=0]
+     */
+    async stop(exitCode = 0) {
+        // (Código inalterado)
+        if (this.isStopping) return;
+this.isStopping = true;
+        this.isRunning = false;
+        console.log(`[BotWorker-${this.accountId}] Comando 'stop' (exitCode: ${exitCode}). Limpando recursos...`);
+if (this.cycleTimeoutId) {
+            clearTimeout(this.cycleTimeoutId);
+            this.cycleTimeoutId = null;
+}
+
+        try {
+            if (this.page) await this.page.close();
+if (this.context) await this.context.close();
+            if (this.browser) await this.browser.close();
+        } catch (e) {
+            console.warn(`[BotWorker-${this.accountId}] Aviso ao fechar Playwright:`, e.message);
+} finally {
+            this.page = null;
+            this.context = null;
+this.browser = null;
+        }
+
+        if (exitCode === 0) {
+            ipcService.sendStatus('PARADO', 'Automação encerrada.');
+}
+        
+        console.log(`[BotWorker-${this.accountId}] Encerrando processo.`);
+        process.exit(exitCode);
+}
+
+    /**
+     * O loop principal de automação (LÓGICA OTIMIZADA).
+*/
+    async runAutomationCycle() {
+        if (!this.isRunning || this.isStopping) {
+            console.log(`[BotWorker-${this.accountId}] Ciclo ignorado (parando).`);
+return;
+        }
+
+        console.log(`[BotWorker-${this.accountId}] Iniciando ciclo de automação...`);
+try {
+            // 1. VERIFICAÇÕES DE SEGURANÇA
+            if (this.page.isClosed()) throw new Error("A página foi fechada (isClosed() === true).");
+const captchaDetected = await checkForCaptcha(this.page, this.accountId);
+            if (captchaDetected) {
+                ipcService.sendStatus('CAPTCHA_DETECTADO', 'CAPTCHA Detectado. Bot parado.');
+await this.stop(0);
+                return;
+            }
+            
+            // O Village ID da config deve ser o ID real agora (se o login funcionou)
+            const villageIdToUse = this.config.villageId;
+
+
+            // 2. EXTRAÇÃO DE ESTADO (A ÚNICA RECARGA DE PÁGINA)
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Extraindo estado do jogo...');
+const gameState = await stateExtractorModule.execute(this.page, ipcService.sendStatus, this.config);
+            
+            if (!gameState || !gameState.csrfToken) {
+                throw new Error('Falha ao extrair gameState ou Token CSRF (h).');
+}
+            
+            // (v39) Se o ID estava null na config (por falha de sincronização), mas o StateExtractor encontrou um ID válido,
+            // corrigimos a config AQUI.
+            if (!villageIdToUse && gameState.villageId) {
+                console.warn(`[BotWorker-${this.accountId}] Village ID (Config: null -> Auto-Corrigido para ${gameState.villageId}).`);
+                this.config.villageId = gameState.villageId;
+            }
+            
+            // --- (v22) INÍCIO DA MODIFICAÇÃO ---
+            // 3. ATUALIZAÇÃO DA CONFIG (Busca Construção E Recrutamento)
+            // (v42) Passa a instância da API (com token) para o fetchBotConfig
+            const { constructionListId, recruitmentTemplate, autoFarm, autoWarehouse } = await this.fetchBotConfig(apiService.api);
+this.config.constructionListId = constructionListId;
+            this.config.recruitmentTemplate = recruitmentTemplate;
+            // (v42) Atualiza a config com os valores do banco de dados (que falharam antes)
+            this.config.auto_farm_enabled = autoFarm;
+            this.config.auto_warehouse_enabled = autoWarehouse;
+            // --- (v22) FIM DA MODIFICAÇÃO ---
+            
+            // --- INÍCIO DOS MÓDULOS DE AÇÃO (SEM NAVEGAÇÃO) ---
+            
+            // 4. AÇÃO: MISSÕES
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Coletando missões...');
+await missionModule.execute(this.page, ipcService.sendStatus, this.config, gameState);
+            if (!this.isRunning) return;
+            await randomWait(3000, 7000);
+// 5. AÇÃO: RECOMPENSAS
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Coletando recompensas...');
+await rewardsModule.execute(this.page, ipcService.sendStatus, this.config, gameState);
+            if (!this.isRunning) return;
+            await randomWait(3000, 7000);
+// 6. AÇÃO: SCAVENGER
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Executando: Coleta (Scavenger)...');
+const newScavengeState = await scavengerModule.execute(this.page, ipcService.sendStatus, this.config, gameState);
+            if (newScavengeState) {
+                console.log(`[BotWorker-${this.accountId}] Estado da Coleta atualizado pela ação.`);
+gameState.scavengeInfo = newScavengeState; 
+            }
+            if (!this.isRunning) return;
+await randomWait(3000, 7000);
+            
+            // 7. AÇÃO: CONSTRUÇÃO
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Executando: Construção...');
+            // --- (v42) INÍCIO DA CORREÇÃO ---
+            // Injeta a instância 'api' e captura o retorno
+            const newVillageStateConst = await constructionModule.execute(this.page, ipcService.sendStatus, this.config, gameState, apiService.api);
+            if (newVillageStateConst) {
+                console.log(`[BotWorker-${this.accountId}] Estado da Aldeia (village) atualizado pela ação de CONSTRUÇÃO.`);
+                gameState.village = newVillageStateConst; 
+                // (v42) Atualiza o 'gameState.resources' local para o próximo módulo
+                gameState.resources = {
+                    wood: gameState.village?.wood ?? 0,
+                    clay: gameState.village?.stone ?? 0,
+                    iron: gameState.village?.iron ?? 0,
+                    storage: { max: gameState.village?.storage_max ?? 0 },
+                };
+            }
+            // --- (v42) FIM DA CORREÇÃO ---
+            if (!this.isRunning) return;
+            await randomWait(3000, 7000);
+// --- (v22) INÍCIO DA MODIFICAÇÃO ---
+            // 8. AÇÃO: RECRUTAMENTO
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Executando: Recrutamento...');
+// (v27) Captura o retorno do módulo, que pode conter o novo estado de 'village'
+            const newVillageStateRec = await recruitmentModule.execute(this.page, ipcService.sendStatus, this.config, gameState);
+            if (newVillageStateRec) {
+                console.log(`[BotWorker-${this.accountId}] Estado da Aldeia (village) atualizado pela ação de recrutamento.`);
+                gameState.village = newVillageStateRec; // Atualiza o gameState principal
+            }
+if (!this.isRunning) return;
+            await randomWait(3000, 7000);
+            // --- (v22) FIM DA MODIFICAÇÃO ---
+
+            // 9. ATUALIZAÇÃO DO DASHBOARD (MOVIDO PARA O FIM)
+            // (v42) Agora envia o 'gameState' que foi atualizado por construção E recrutamento
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Sincronizando painel...');
+dashboardService.updateDashboardState(this.accountId, gameState);
+
+            // --- FIM DOS MÓDULOS DE AÇÃO ---
+
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Ciclo completo. Aguardando...');
+} catch (cycleError) {
+            console.error(`[BotWorker-${this.accountId}] Erro durante o ciclo:`, cycleError);
+ipcService.sendStatus('FALHA!', `Erro no ciclo: ${cycleError.message}`);
+            
+            // Lógica de Recuperação
+            if (this.page.isClosed() || cycleError.message.includes('Not attached') || cycleError.message.includes('ERR_TUNNEL_CONNECTION_FAILED')) {
+                console.error(`[BotWorker-${this.accountId}] Erro fatal (página morta ou proxy). Parando.`);
+await this.stop(1);
+            } else {
+                try {
+                    await this.page.reload({ waitUntil: 'domcontentloaded' });
+ipcService.sendStatus('EM_EXECUÇÃO', 'Página recarregada após erro.');
+                } catch (reloadError) {
+                    console.error(`[BotWorker-${this.accountId}] Falha ao recarregar a página. Parando...`, reloadError);
+await this.stop(1);
+                }
+            }
+        } finally {
+            // 10. AGENDAMENTO DO PRÓXIMO CICLO (Código inalterado)
+            if (this.isRunning && !this.isStopping) {
+                const userMinMs = (this.config.cycleMinMinutes || 5) * 60000;
+const userMaxMs = (this.config.cycleMaxMinutes || 7) * 60000;
+                const botExtraMinMs = 0.5 * 60000;
+                const botExtraMaxMs = 1.5 * 60000;
+const nextWaitTimeMs = (userMinMs + Math.random() * (userMaxMs - userMaxMs)) + (botExtraMinMs + Math.random() * (botExtraMaxMs - botExtraMinMs));
+ipcService.sendStatus('EM_EXECUÇÃO', `Próximo ciclo em ${(nextWaitTimeMs / 60000).toFixed(1)} min.`);
+                console.log(`[BotWorker-${this.accountId}] Próximo ciclo agendado em ${(nextWaitTimeMs / 60000).toFixed(2)} minutos.`);
+this.cycleTimeoutId = setTimeout(() => this.runAutomationCycle(), nextWaitTimeMs);
+            }
+        }
+    }
+
+    /**
+     * (v22) Busca a config de automação (Construção E Recrutamento).
+*/
+    // (v42) Recebe a instância da API autenticada
+    async fetchBotConfig(apiInstance) {
+        
+        // (v42) Retorna um objeto padrão em caso de falha
+        const defaultConfig = {
+            constructionListId: null,
+            recruitmentTemplate: null,
+            autoFarm: false,
+            autoWarehouse: false
+        };
+
+        // (v42) Verifica se a instância da API está disponível
+        if (!apiInstance) {
+            console.warn(`[BotWorker-${this.accountId}] fetchBotConfig falhou: apiInstance não fornecida.`);
+            return defaultConfig;
+        }
+
+        try {
+            ipcService.sendStatus('EM_EXECUÇÃO', 'Sincronizando config de automação...');
+            
+            // --- CORREÇÃO DE ROTA (V40) ---
+            const configResponse = await apiInstance.get('/api/data/dashboard-data'); // <-- CORRIGIDO
+            // --- FIM DA CORREÇÃO ---
+            
+            if (configResponse.data?.tw_accounts) {
+                const accountData = configResponse.data.tw_accounts.find(acc => String(acc.id) === String(this.accountId));
+if (accountData) {
+                    // (v42) Retorna o objeto completo
+                    return { 
+                        constructionListId: accountData.constructionListId || null,
+                        recruitmentTemplate: accountData.recruitmentTemplate || null,
+                        autoFarm: accountData.auto_farm_enabled || false,
+                        autoWarehouse: accountData.auto_warehouse_enabled || false
+                    };
+}
+            }
+            console.warn(`[BotWorker-${this.accountId}] fetchBotConfig: Conta ${this.accountId} não encontrada no dashboard-data.`);
+            return defaultConfig;
+} catch (apiError) {
+            console.warn(`[BotWorker-${this.accountId}] Falha ao buscar config de automação: ${apiError.message}`);
+return defaultConfig; // Retorna o padrão em caso de erro 404
+        }
+    }
+}
+
+module.exports = BotWorker;
+
+====================
+ARQUIVO: .\src\main\worker_core\dashboardService.cjs
+====================
+// src/main/services/dashboard_service.cjs (REATORAÇÃO v12 - Status da Coleta)
+
+/**
+ * Formata os dados brutos de scavengeInfo para o ViewModel do painel.
+ * @param {Object} scavengeInfo - O objeto gameState.scavengeInfo (que é o objeto 'village' da API de coleta)
+ * @returns {Object} - Um objeto formatado para a UI.
+ */
+function formatScavengeStatus(scavengeInfo) {
+    // Estado padrão
+    const status = {
+        overallStatus: 'Inativo', // 'Inativo', 'Coletando', 'Desbloqueando', 'Bloqueado'
+        options: []
+    };
+
+    if (!scavengeInfo || !scavengeInfo.options) {
+        // Se não houver dados, retorna 4 slots bloqueados (para UI)
+        for (let i = 1; i <= 4; i++) {
+            status.options.push({ id: String(i), status: 'Bloqueado', timestamp: null });
+        }
+        status.overallStatus = 'Bloqueado';
+        return status; 
+    }
+
+    const options = scavengeInfo.options;
+    let isCollecting = false;
+    let isUnlocking = false;
+    let allLocked = true;
+
+    // O ID das opções no TW é "1", "2", "3", "4"
+    for (const optionId in options) {
+        const opt = options[optionId];
+        const optionStatus = {
+            id: optionId,
+            status: 'Bloqueado', // 'Bloqueado', 'Desbloqueando', 'Inativo', 'Coletando'
+            timestamp: null // (timestamp de 'return_time' or 'unlock_time')
+        };
+
+        if (opt.scavenging_squad !== null) {
+            // Está coletando
+            optionStatus.status = 'Coletando';
+            optionStatus.timestamp = opt.scavenging_squad.return_time || null;
+            isCollecting = true;
+            allLocked = false;
+        } else if (opt.unlock_time !== null) {
+            // Está desbloqueando (e o tempo não é nulo)
+            optionStatus.status = 'Desbloqueando';
+            optionStatus.timestamp = opt.unlock_time;
+            isUnlocking = true;
+            allLocked = false;
+        } else if (opt.is_locked === false) {
+            // Não está coletando, não está desbloqueando, mas está aberto
+            optionStatus.status = 'Inativo';
+            allLocked = false;
+        }
+        // Se nenhum dos acima, o status 'Bloqueado' padrão permanece
+
+        status.options.push(optionStatus);
+    }
+
+    // Define o status geral (para a cor da coluna)
+    if (isCollecting) {
+        status.overallStatus = 'Coletando';
+    } else if (isUnlocking) {
+        status.overallStatus = 'Desbloqueando';
+    } else if (!allLocked) {
+        status.overallStatus = 'Inativo';
+    }
+    // Se não, permanece 'Bloqueado'
+
+    return status;
+}
+
+
+/**
+ * Constrói o View Model de recursos e o envia para o Main Process (index.cjs)
+ * para ser retransmitido à UI (React).
+ *
+ * @param {string} currentAccountId - O ID da conta para taguear a mensagem.
+ * @param {Object} gameState - O objeto de estado extraído (window.game_data).
+ */
+function updateDashboardState(currentAccountId, gameState) {
+    // Validação inicial (mantida)
+    if (!currentAccountId) {
+        console.error('[DashboardService] Tentativa de notificar UI sem currentAccountId.');
+        return;
+    }
+
+    // Validação MÍNIMA: Garante que gameState existe
+    if (!gameState) {
+         console.warn(`[DashboardService-${currentAccountId}] Tentativa de notificar UI com gameState nulo ou undefined.`);
+        return; // Retorna se o gameState inteiro for nulo
+    }
+
+    try {
+        // **** INÍCIO DA MODIFICAÇÃO (v12): Construção do viewModel com Coleta ****
+        const viewModel = {
+            // Usa optional chaining (?.) e nullish coalescing (??) para evitar erros
+            playerPoints: 
+            Math.floor(gameState.player?.points ?? 0),
+            resources: {
+                wood: Math.floor(gameState.village?.wood ?? 0), 
+                clay: Math.floor(gameState.village?.stone ?? 0), 
+                iron: Math.floor(gameState.village?.iron ?? 0), 
+                population: {
+                    current: gameState.village?.pop ?? 0,
+                    max: gameState.village?.pop_max ?? 0
+                },
+                storage: {
+                    max: gameState.village?.storage_max ?? 0
+                }
+            },
+            // Nova propriedade para o status da coleta (formatada)
+            scavengeStatus: formatScavengeStatus(gameState.scavengeInfo)
+        };
+        // **** FIM DA MODIFICAÇÃO (v12) ****
+
+        // Log para depuração
+        // console.log(`[DashboardService-${currentAccountId}] Enviando viewModel:`, JSON.stringify(viewModel));
+        
+        // Envia os dados para o Main Process (index.cjs) via IPC
+        if (process.connected) {
+            process.send({
+                type: 'dashboard-update', // Canal que o React (via Preload) espera
+                accountId: currentAccountId,
+                state: viewModel, // Envia o objeto 'state' completo
+                timestamp: new Date().toISOString()
+            });
+        } else {
+             console.warn(`[DashboardService-${currentAccountId}] Canal IPC desconectado, não é possível enviar dashboard-update.`);
+        }
+
+    } catch (error) {
+        // Captura erros inesperados da construção do objeto ou do process.send()
+        console.error(`[DashboardService-${currentAccountId}] Falha INESPERADA ao construir ou enviar o View Model: ${error.message}`, error);
+    }
+}
+
+module.exports = {
+    updateDashboardState
+};
+
+====================
+ARQUIVO: .\src\main\worker_core\ipcService.cjs
+====================
+// src/main/worker_core/ipcService.cjs (NOVO)
+// Gerencia toda a comunicação IPC (process.send) para o processo principal.
+
+let accountId = 'UNKNOWN';
+
+/**
+ * Inicializa o serviço com o ID da conta.
+ * @param {string} id
+ */
+function init(id) {
+    accountId = id;
+}
+
+/**
+ * Função base para enviar mensagens.
+ * @param {string} type - O tipo da mensagem (ex: 'statusUpdate')
+ * @param {object} payload - O conteúdo da mensagem
+ */
+function send(type, payload) {
+    if (!accountId) {
+        console.error('[ipcService] Tentativa de enviar mensagem sem AccountID definido.');
+        return;
+    }
+    if (process.connected) {
+        try {
+            process.send({
+                type: type,
+                accountId: accountId,
+                ...payload,
+                timestamp: new Date().toISOString()
+            });
+        } catch (ipcError) {
+            console.error(`[ipcService-${accountId}] Erro ao enviar mensagem IPC:`, ipcError);
+            // Se o IPC falhar, o worker não pode mais ser controlado.
+            process.exit(1);
+        }
+    } else {
+        console.warn(`[ipcService-${accountId}] Canal IPC desconectado, não é possível enviar tipo ${type}.`);
+        // Se o canal cair, paramos o worker.
+        process.exit(1);
+    }
+}
+
+/**
+ * Envia uma atualização de status padrão.
+ * @param {string} status 
+ * @param {string} log 
+ */
+function sendStatus(status, log) {
+    send('statusUpdate', { status: status, log: log });
+}
+
+/**
+ * Envia uma atualização de status do proxy.
+ * @param {'valid' | 'invalid' | 'not_used'} proxyStatus 
+ */
+function sendProxyStatus(proxyStatus) {
+    send('proxyStatusUpdate', { proxyStatus: proxyStatus });
+}
+
+/**
+ * Envia os cookies de sessão atualizados para o processo principal.
+ * @param {Array} cookies 
+ */
+function sendSessionUpdate(cookies) {
+    console.log(`[ipcService-${accountId}] Enviando cookies atualizados para o Main Process.`);
+    send('sessionUpdate', { payload: { cookies: cookies } });
+}
+
+/**
+ * Envia o novo Access Token para o processo principal.
+ * @param {string} newAccessToken 
+ */
+function sendTokenUpdate(newAccessToken) {
+    console.log(`[ipcService-${accountId}] Enviando 'tokenUpdate' para o Main Process.`);
+    send('tokenUpdate', { payload: { newAccessToken: newAccessToken } });
+}
+
+/**
+ * Envia dados formatados para o dashboard.
+ * @param {object} stateViewModel 
+ */
+function sendDashboardUpdate(stateViewModel) {
+    send('dashboard-update', { state: stateViewModel });
+}
+
+module.exports = {
+    init,
+    sendStatus,
+    sendProxyStatus,
+    sendSessionUpdate,
+    sendTokenUpdate,
+    sendDashboardUpdate
+};
+
+====================
+ARQUIVO: .\src\preload\preload.cjs
+====================
+// src/preload/preload.cjs (v21) - Adiciona Handlers de Recrutamento
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  login: async (credentials) => {
+    console.log('{preload] Recebido pedido de login:', credentials);
+    try {
+      const result = await ipcRenderer.invoke('login', credentials);
+      console.log('{preload] Resultado do invoke("login"):', result);
+      return result;
+    } catch (error) {
+      console.error('{preload] Erro durante invoke("login"):', error);
+      throw error;
+    }
+  },
+
+  register: async (userData) => {
+    // (Adicionar logs aqui se necessário)
+    return ipcRenderer.invoke('register', userData);
+  },
+
+  // **** NOVO: Função para o App.jsx pedir um novo Access Token ****
+  refreshToken: async (token) => {
+    console.log('{preload] Solicitando refresh do token...');
+    return ipcRenderer.invoke('refreshToken', token);
+  },
+
+  // **** NOVO: Função para o App.jsx invalidar o Refresh Token no logout ****
+  logout: async (refreshToken) => {
+    console.log('{preload] Solicitando logout (invalidar refresh token)...');
+    return ipcRenderer.invoke('logout', refreshToken);
+  },
+
+  // BUSCA DE DADOS
+  fetchDashboardData: async (token) => {
+    // (Adicionar logs aqui se necessário)
+    return ipcRenderer.invoke('fetchDashboardData', token);
+  },
+
+  // GESTÃO DE CONTAS TW
+  addTwAccount: async (data) => {
+    console.log('{preload] addTwAccount recebendo:', data);
+    return ipcRenderer.invoke('addTwAccount', data);
+  },
+
+  deleteTwAccount: async (data) => {
+    return ipcRenderer.invoke('deleteTwAccount', data);
+  },
+
+  // NOVO: Método para atualizar a conta (ex: proxy)
+  updateTwAccount: async (accountId, data) => {
+    console.log(`{preload] updateTwAccount para ID ${accountId} com dados:`, data);
+    return ipcRenderer.invoke('update-tw-account', accountId, data);
+  },
+
+  authenticateAccount: async (data) => {
+    return ipcRenderer.invoke('authenticateAccount', data);
+  },
+
+  // GESTÃO DE PROXY
+  addProxies: async (data) => {
+    return ipcRenderer.invoke('addProxies', data);
+  },
+
+  deleteProxy: async (data) => {
+    return ipcRenderer.invoke('deleteProxy', data);
+  },
+
+  // =================================================================
+  // GESTÃO DE AUTOMAÇÃO (LOCAL) - start e stop
+  // =================================================================
+  startAutomation: async (data) => {
+    console.log('{preload] Chamando start-automation para conta:', data.accountId);
+    return ipcRenderer.invoke('start-automation', data);
+  },
+
+  stopAutomation: async (accountId) => {
+    console.log('{preload] Chamando stop-automation para conta:', accountId);
+    return ipcRenderer.invoke('stop-automation', accountId);
+  },
+
+  startVillageViewer: async (data) => {
+    console.log('{preload] Chamando startVillageViewer para conta:', data.account.id);
+    return ipcRenderer.invoke('startVillageViewer', data);
+  },
+
+  // --- Listas de Construção ---
+  fetchConstructionLists: (token) => ipcRenderer.invoke('fetchConstructionLists', token),
+  createConstructionList: (token, listData) => ipcRenderer.invoke('createConstructionList', token, listData),
+  updateConstructionList: (token, listId, listData) => ipcRenderer.invoke('updateConstructionList', token, listId, listData),
+  deleteConstructionList: (token, listId) => ipcRenderer.invoke('deleteConstructionList', token, listId),
+
+  // --- Grupos ---
+  fetchGroups: (token) => ipcRenderer.invoke('fetchGroups', token),
+  createGroup: (token, groupData) => ipcRenderer.invoke('createGroup', token, groupData),
+  updateGroup: (token, groupId, groupData) => ipcRenderer.invoke('updateGroup', token, groupId, groupData),
+  deleteGroup: (token, groupId) => ipcRenderer.invoke('deleteGroup', token, groupId),
+  
+  // --- (v21) INÍCIO DA MODIFICAÇÃO (Templates de Recrutamento) ---
+  fetchRecruitmentTemplates: (token) => ipcRenderer.invoke('fetchRecruitmentTemplates', token),
+  createRecruitmentTemplate: (token, templateData) => ipcRenderer.invoke('createRecruitmentTemplate', token, templateData),
+  updateRecruitmentTemplate: (token, templateId, templateData) => ipcRenderer.invoke('updateRecruitmentTemplate', token, templateId, templateData),
+  deleteRecruitmentTemplate: (token, templateId) => ipcRenderer.invoke('deleteRecruitmentTemplate', token, templateId),
+  // --- (v21) FIM DA MODIFICAÇÃO ---
+
+  // =================================================================
+  // LISTENERS (Eventos do Main para o Renderer)
+  // =================================================================
+
+  onAutomationStatusUpdate: (callback) => {
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on('automation-status-update', listener);
+    return () => ipcRenderer.removeListener('automation-status-update', listener);
+  },
+
+  onProxyStatusUpdate: (callback) => {
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on('automation-proxy-status-update', listener);
+    return () => ipcRenderer.removeListener('automation-proxy-status-update', listener);
+  },
+
+  onDashboardUpdate: (callback) => {
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on('dashboard-update', listener);
+    return () => ipcRenderer.removeListener('dashboard-update', listener);
+  },
+
+  onTokenWasUpdated: (callback) => {
+    const channel = 'token:updated'; 
+    const listener = (_event, data) => {
+      console.log('{preload] Recebido evento token:updated do main process.');
+      callback(data); 
+    };
+    
+    ipcRenderer.on(channel, listener);
+
+    return () => {
+      ipcRenderer.removeListener(channel, listener);
+    };
+  }
+});

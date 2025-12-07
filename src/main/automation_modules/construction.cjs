@@ -1,4 +1,4 @@
-// src/main/automation_modules/construction.cjs (CORRIGIDO PARA BYTENODE)
+// src/main/automation_modules/construction.cjs
 console.log('[Construction] Módulo carregado.');
 
 const BUILDING_ID_MAP = {
@@ -23,9 +23,8 @@ async function execute(page, sendStatus, config, gameState, apiService) {
     const csrfToken = gameState.csrfToken; 
 
     if (!csrfToken) return null;
-
     if (!gameState.buildingsData || !gameState.population || !gameState.resources) return null;
-
+    
     const queue = gameState.constructionQueue || [];
     const MAX_QUEUE = 2; 
     if (queue.length >= MAX_QUEUE) return null;
@@ -35,7 +34,6 @@ async function execute(page, sendStatus, config, gameState, apiService) {
     const currentBuildings = gameState.buildings;
     const pop = gameState.population;
     
-    // --- Lógica de Prioridade (Fazenda/Armazém) ---
     const popUsage = pop.current / pop.max;
     if (config.auto_farm_enabled && popUsage >= 0.80) {
         const farmCost = gameState.buildingsData.farm;
@@ -70,12 +68,11 @@ async function execute(page, sendStatus, config, gameState, apiService) {
     
     const buildingId = nextItem.id;
     const buildingData = gameState.buildingsData ? gameState.buildingsData[buildingId] : null;
-
     if (buildingData && !checkResources(currentRes, buildingData)) {
-        return null; 
+        return null;
     }
     
-    // --- EXECUÇÃO FETCH ---
+    // --- EXECUÇÃO FETCH SEGURA ---
     try {
         const buildUrl = `/game.php?village=${villageId}&screen=main&ajaxaction=upgrade_building&type=main`;
         const refererUrl = page.url(); 
@@ -88,7 +85,6 @@ async function execute(page, sendStatus, config, gameState, apiService) {
         };
         const bodyPayload = new URLSearchParams(payload).toString();
 
-        // **CORREÇÃO CRÍTICA PARA BYTENODE**: Passando a função como string
         const result = await page.evaluate(`
             async ({ url, bodyString, referer }) => {
                 try {
@@ -104,22 +100,27 @@ async function execute(page, sendStatus, config, gameState, apiService) {
                         body: bodyString 
                     });
                     
-                    if (!response.ok) {
-                        return { error: 'Network error: ' + response.statusText };
+                    const text = await response.text();
+                    try {
+                        return JSON.parse(text);
+                    } catch (jsonError) {
+                        return { error: 'Invalid JSON', raw: text.substring(0, 100) };
                     }
-                    return await response.json();
                 } catch (e) {
-                   return { error: 'Falha ao parsear resposta: ' + e.message };
+                    return { error: 'Network/Fetch error: ' + e.message };
                 }
             }
         `, { url: buildUrl, bodyString: bodyPayload, referer: refererUrl });
 
-        if (result?.response?.success && result?.game_data?.village) { 
-            return result.game_data.village; 
-        } else if (result?.response?.success) {
-            return null;
+        if (result?.response?.success) { 
+            // Se tiver dados da aldeia atualizados, retorna eles
+            if (result.game_data && result.game_data.village) {
+                return result.game_data.village;
+            }
+            return null; // Sucesso, mas sem dados novos de aldeia
         } else {
-            console.warn(`[Construction-${accountId}] Falha:`, JSON.stringify(result));
+            const errorMsg = result?.error || result?.error_msg || JSON.stringify(result);
+            console.warn(`[Construction-${accountId}] Falha ao construir ${nextItem.id}: ${errorMsg}`);
             return null;
         }
 

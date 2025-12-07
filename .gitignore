@@ -1,7 +1,20 @@
-node_modules
-dist
-dist-renderer
-release-builds
-.env
+# Dependências
+node_modules/
+
+# Builds e Distribuição
+dist/
+dist-renderer/
+release-builds/
+out/
+
+# Pasta do Navegador (Binários pesados)
+browsers/
+
+# Arquivos de sistema/IDE
 .DS_Store
-Thumbs.db
+.vscode/
+.idea/
+
+# Logs e Variáveis de Ambiente
+*.log
+.env"projeto_completo.txt" 

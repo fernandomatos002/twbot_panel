@@ -11,6 +11,15 @@ const path = require('path');
 const fs = require('fs');
 const Store = require('electron-store');
 
+if (app.isPackaged) {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.resourcesPath, 'browsers');
+} else {
+
+    process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(__dirname, '../../browsers');
+}
+
+console.log(`[Main] Browsers Path: ${process.env.PLAYWRIGHT_BROWSERS_PATH}`);
+
 function loadModule(moduleName) {
   const jscPath = path.join(__dirname, `${moduleName}.jsc`);
   if (fs.existsSync(jscPath)) {

@@ -1,6 +1,5 @@
-// src/main/automation_modules/scavenger.cjs (CORRIGIDO PARA BYTENODE)
+// src/main/automation_modules/scavenger.cjs
 const { randomWait } = require('../utils/helpers.cjs');
-
 const WEIGHTS = { "1": 15, "2": 6, "3": 3, "4": 2 };
 const MIN_INFANTRY_TO_SCAVENGE = 10;
 const CARRY_CAPACITY = { spear: 25, sword: 15 };
@@ -46,7 +45,6 @@ async function execute(page, sendStatus, config, gameState) {
         // --- Envio de Tropas ---
         const freeSlots = [];
         const currentOptionsState = newScavengeState ? (newScavengeState.options || options) : options;
-        
         for (const optionId in currentOptionsState) {
             const opt = currentOptionsState[optionId];
             if (opt.scavenging_squad === null && opt.is_locked === false) {
@@ -55,7 +53,7 @@ async function execute(page, sendStatus, config, gameState) {
         }
 
         if (freeSlots.length === 0 || totalInfantryPool < MIN_INFANTRY_TO_SCAVENGE) return newScavengeState;
-
+        
         let totalWeight = 0;
         for (const id of freeSlots) totalWeight += WEIGHTS[id] || 0;
         if (totalWeight === 0) return newScavengeState;
@@ -92,7 +90,6 @@ async function execute(page, sendStatus, config, gameState) {
         }
         
         return newScavengeState;
-
     } catch (error) {
         console.error(`[Scavenger-${accountId}] Erro:`, error);
         return newScavengeState;
@@ -100,10 +97,11 @@ async function execute(page, sendStatus, config, gameState) {
 }
 
 function checkResourcesForUnlock(accountId, currentRes, costs, optionId) {
+    if (!costs) return true;
     return !(currentRes.wood < costs.wood || currentRes.clay < costs.stone || currentRes.iron < costs.iron);
 }
 
-// --- CORREÇÃO: Funções 'evaluate' convertidas para String ---
+// --- Funções Auxiliares Blindadas ---
 
 async function unlockScavengeOption(page, config, csrfToken, optionId) {
     const url = `/game.php?village=${config.villageId}&screen=scavenge_api&ajaxaction=start_unlock`;
@@ -125,18 +123,18 @@ async function unlockScavengeOption(page, config, csrfToken, optionId) {
                     },
                     body: bodyString
                 });
-                if (!response.ok) return { error: 'Network error: ' + response.statusText };
-                return await response.json();
+                const text = await response.text();
+                try { return JSON.parse(text); } catch(e) { return { error: 'JSON Error', raw: text }; }
             } catch (e) {
                 return { error: 'Fetch error: ' + e.message };
             }
         }
     `, { url, bodyString: bodyPayload, referer: refererUrl });
 
-    if (result.response && result.response.village) {
+    if (result && result.response && result.response.village) {
         return result.response.village; 
     }
-    return null; 
+    return null;
 }
 
 async function sendScavengeSquad(page, config, csrfToken, optionId, troops, carryCapacity) {
@@ -173,15 +171,15 @@ async function sendScavengeSquad(page, config, csrfToken, optionId, troops, carr
                     },
                     body: bodyString
                 });
-                if (!response.ok) return { error: 'Network error: ' + response.statusText };
-                return await response.json();
+                const text = await response.text();
+                try { return JSON.parse(text); } catch(e) { return { error: 'JSON Error', raw: text }; }
             } catch (e) {
                 return { error: 'Fetch error: ' + e.message };
             }
         }
     `, { url, bodyString: bodyPayload, referer: refererUrl });
 
-    if (result.response && result.response.villages && result.response.villages[config.villageId]) {
+    if (result && result.response && result.response.villages && result.response.villages[config.villageId]) {
         return result.response.villages[config.villageId] || null;
     }
     return null;

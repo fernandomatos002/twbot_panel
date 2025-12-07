@@ -1,4 +1,4 @@
-// src/main/automation_modules/missions.cjs (CORRIGIDO PARA BYTENODE)
+// src/main/automation_modules/missions.cjs
 const { randomWait } = require('../utils/helpers.cjs');
 
 async function execute(page, sendStatus, config, gameState) {
@@ -10,11 +10,10 @@ async function execute(page, sendStatus, config, gameState) {
 
     const missionsToCollect = gameState.completedMissions || [];
     if (missionsToCollect.length === 0) return;
-
+    
     sendStatus('EM_EXECUÇÃO', `Coletando missões...`);
     const refererUrl = page.url();
-    let coletadas = 0;
-
+    
     try {
         for (const mission of missionsToCollect) {
             if (!process.connected) return;
@@ -23,7 +22,6 @@ async function execute(page, sendStatus, config, gameState) {
             const payload = { h: csrfToken };
             const bodyPayload = new URLSearchParams(payload).toString();
 
-            // **CORREÇÃO**: Stringified function
             const result = await page.evaluate(`
                 async ({ url, bodyString, referer }) => {
                     try {
@@ -38,25 +36,29 @@ async function execute(page, sendStatus, config, gameState) {
                             },
                             body: bodyString
                         });
-                        if (!response.ok) return { error: 'Network error: ' + response.statusText };
-                        return await response.json();
+                        
+                        const text = await response.text();
+                        try {
+                            return JSON.parse(text);
+                        } catch (e) {
+                            return { error: 'Invalid JSON', raw: text.substring(0, 50) };
+                        }
                     } catch (e) {
                         return { error: 'Fetch error: ' + e.message };
                     }
                 }
             `, { url: collectUrl, bodyString: bodyPayload, referer: refererUrl });
 
-            if (result.response && !result.error) {
-                coletadas++;
+            // A resposta de sucesso pode variar, geralmente checamos se não há erro
+            if (result && !result.error && result.response !== false) {
+                // Sucesso
             } else {
-                if (result.error || result.response === false) {
-                    sendStatus('EM_EXECUÇÃO', `Falha ao coletar missão.`);
-                }
+                console.warn(`[Missions-${accountId}] Falha ao coletar:`, JSON.stringify(result));
             }
-            await randomWait(2500, 4500);
+            await randomWait(1500, 3000);
         }
     } catch (error) {
-        console.error(`[Missions-${accountId}] Erro:`, error);
+        console.error(`[Missions-${accountId}] Erro:`, error.message);
     }
 }
 

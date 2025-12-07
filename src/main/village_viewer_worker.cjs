@@ -57,7 +57,6 @@ async function sendResultAndExit(payload) {
             });
         } catch (ipcError) { }
     }
-
     process.exit(payload.success ? 0 : 1);
 }
 
@@ -86,7 +85,6 @@ function startBrowserMonitor() {
 async function runVillageViewer(receivedConfig) {
     config = receivedConfig;
     const { accountId, gameUrl, cookies, proxyConfig } = config;
-
     if (!accountId || !gameUrl || !cookies || cookies.length === 0) {
         await sendResultAndExit({ success: false, error: 'Configuração inválida.', shouldRestart: false });
         return;
@@ -95,7 +93,6 @@ async function runVillageViewer(receivedConfig) {
     try {
         browser = await chromiumInstance.launch({
             headless: false,
-            channel: 'chrome',
             proxy: proxyConfig || undefined
         });
 
@@ -109,7 +106,6 @@ async function runVillageViewer(receivedConfig) {
         await context.addCookies(cookies);
 
         const page = await context.newPage();
-
         page.on('close', async () => {
             if (!isExiting) {
                 await sendResultAndExit({ success: true, message: 'Visualizador fechado pelo usuário.', shouldRestart: true });
@@ -120,7 +116,6 @@ async function runVillageViewer(receivedConfig) {
 
         const currentUrl = page.url();
         const isLoggedIn = currentUrl.includes('/game.php');
-
         if (!isLoggedIn) {
             throw new Error('Sessão inválida ou expirada.');
         }
